@@ -71,6 +71,7 @@ local Config = {
     OrbReachDistance       = 16,   -- studs: max distance to consider TARGET_REACHED
     OrbMoveMaxRetries      = 3,    -- max move attempts before giving up
     OrbMoveRetryWait       = 0.5,  -- seconds between retry attempts
+    AntiAfkInterval        = 600,  -- seconds: 10 minutes without input triggers keep-alive
 }
 
 -- ════════════════════════════════════════════════════════════════
@@ -102,6 +103,7 @@ local State = {
     AutoTrial        = false,
     AutoOrb          = false,
     ReturnAfterOrb   = false,
+    AntiAfkEnabled   = true,
 
     -- Safe Return Position (manual only)
     SafeReturnPosition = nil, -- CFrame or nil
@@ -423,14 +425,9 @@ local Actions = {}
 
 --[[
     EnterTrial:
-    Locates the positive confirmation button inside PlayerGui.Invite.
-    Searches for ANY GuiButton (TextButton or ImageButton).
-    Identification heuristics:
-      1. TextButton with accept keywords (join/yes/enter/accept/confirm/ok)
-      2. ImageButton with green-ish BackgroundColor3
-    Fires MouseButton1Click on the identified button.
-    Actual entry is NOT confirmed here — the Confirmation Layer
-    waits for Time Trial container in _ENEMIES.Server.Gamemode.
+    Scans the Invite GUI strictly for the intended Time Trial Confirm button.
+    It rejects the structural Template and enforces exact naming ("Confirm")
+    and explicit gamemode ancestor verification.
 ]]
 function Actions.EnterTrial(context)
     if context.isCancelled() then return false, "cancelled" end
@@ -445,63 +442,60 @@ function Actions.EnterTrial(context)
     local ok, enabled = pcall(function() return invite.Enabled end)
     if not ok or not enabled then return false, "invite_not_enabled" end
 
-    -- Scan for a clickable GuiButton (TextButton OR ImageButton).
-    local targetButton = nil
+    -- Scan for the EXACT "Confirm" GuiButton structurally linked to a Time Trial Prompt
+    local candidates = {}
     local ok2, descendants = pcall(function() return invite:GetDescendants() end)
     if not ok2 then return false, "cannot_scan_invite" end
 
     for _, desc in ipairs(descendants) do
         if context.isCancelled() then return false, "cancelled" end
-        if desc:IsA("GuiButton") then  -- covers both TextButton and ImageButton
+        
+        if desc:IsA("GuiButton") and desc.Name == "Confirm" then
             local btnOk, btnVisible = pcall(function() return desc.Visible end)
-            if btnOk and btnVisible then
-                -- Strategy 1: TextButton with accept keywords
-                if desc:IsA("TextButton") then
-                    local txtOk, btnText = pcall(function() return desc.Text end)
-                    if txtOk and btnText then
-                        local lower = btnText:lower()
-                        if lower:find("join", 1, true)
-                            or lower:find("yes", 1, true)
-                            or lower:find("enter", 1, true)
-                            or lower:find("accept", 1, true)
-                            or lower:find("confirm", 1, true)
-                            or lower:find("ok", 1, true) then
-                            targetButton = desc
-                            break
-                        end
+            local actOk, btnActive = pcall(function() return desc.Active end)
+            local intOk, btnInteractable = pcall(function() return desc.Interactable end)
+            
+            -- If Interactable isn't present, assume true if it passed Active/Visible
+            local isInteractable = true
+            if intOk then isInteractable = btnInteractable end
+
+            if btnOk and btnVisible and actOk and btnActive and isInteractable then
+                local hasTemplate = false
+                local hasValidGamemode = false
+                local current = desc.Parent
+                
+                -- Traverse ancestors strictly checking for Template vs Real Gamemode
+                while current do
+                    if current.Name == "Template" then
+                        hasTemplate = true
+                        break
                     end
+                    if current.Name:lower():find("gamemode_time trial_", 1, true) then
+                        hasValidGamemode = true
+                    end
+                    current = current.Parent
                 end
 
-                -- Strategy 2: ImageButton with green-ish color (positive action)
-                if desc:IsA("ImageButton") then
-                    local colOk, bgColor = pcall(function() return desc.BackgroundColor3 end)
-                    if colOk and bgColor then
-                        -- Green detection: G channel significantly higher than R
-                        if bgColor.G > 0.4 and bgColor.G > bgColor.R * 1.3 then
-                            targetButton = desc
-                            break
-                        end
-                    end
-                    -- Also check Image name for check/accept patterns
-                    local imgOk, imgSrc = pcall(function() return desc.Image end)
-                    if imgOk and imgSrc and imgSrc ~= "" then
-                        local lowerImg = imgSrc:lower()
-                        if lowerImg:find("check", 1, true)
-                            or lowerImg:find("accept", 1, true)
-                            or lowerImg:find("confirm", 1, true)
-                            or lowerImg:find("yes", 1, true) then
-                            targetButton = desc
-                            break
-                        end
-                    end
+                if not hasTemplate and hasValidGamemode then
+                    table.insert(candidates, desc)
                 end
             end
         end
     end
 
-    if not targetButton then 
-        Logger.log("[ACTION] EnterTrial: Cannot determine correct button safely", "warn")
-        return false, "ambiguous_button" 
+    local targetButton = nil
+    if #candidates == 1 then
+        targetButton = candidates[1]
+    elseif #candidates == 0 then
+        Logger.log("[ACTION] EnterTrial: No valid Time Trial Confirm button found", "warn")
+        return false, "trial_confirm_not_found"
+    else
+        local paths = ""
+        for i, c in ipairs(candidates) do
+            paths = paths .. c:GetFullName() .. (i < #candidates and ", " or "")
+        end
+        Logger.log("[ACTION] EnterTrial: Ambiguous confirm buttons found: " .. paths, "warn")
+        return false, "ambiguous_trial_confirm"
     end
 
     if context.isCancelled() then return false, "cancelled" end
@@ -836,6 +830,23 @@ function Actions.ReturnToSafePosition(context)
     return true, "returned"
 end
 
+--[[
+    AntiAfkPulse:
+    Isolated keep-alive mechanism to prevent idle disconnection.
+    No gameplay logic inside this adapter.
+]]
+function Actions.AntiAfkPulse()
+    local ok, vu = pcall(function() return game:GetService("VirtualUser") end)
+    if ok and vu then
+        local success = pcall(function()
+            vu:CaptureController()
+            vu:ClickButton2(Vector2.new())
+        end)
+        return success
+    end
+    return false
+end
+
 -- ════════════════════════════════════════════════════════════════
 -- SECTION 8: FORWARD DECLARATIONS
 -- ════════════════════════════════════════════════════════════════
@@ -846,6 +857,7 @@ local ActionController = {}
 local Detection      = {}
 local Confirmation   = {}
 local GuiModule      = {}
+local AntiAfkSystem  = {}
 
 -- ════════════════════════════════════════════════════════════════
 -- SECTION 9: STATE MACHINE
@@ -1116,19 +1128,74 @@ function ActionController.RequestCollectOrb(orbInfo)
             item = orbInfo,
         })
 
-        if not success and State.CurrentAction.attemptId == attemptId and not State.CurrentAction.cancelled then
+        if success and State.CurrentAction.attemptId == attemptId and not State.CurrentAction.cancelled then
+            -- WATCHDOG: Wait for the standard confirmation window
+            task.wait(Config.CollectConfirmWindow)
+            
+            -- If the action is STILL locked by this attempt, the Confirmation Layer did not confirm it
+            if State.CurrentAction.attemptId == attemptId and not State.CurrentAction.cancelled then
+                if not orbInfo.collected then
+                    -- Revalidate exact same orb including Enabled property
+                    local promptEnabled = true
+                    if isInstanceValid(orbInfo.prompt) then
+                        local okE, isE = pcall(function() return orbInfo.prompt.Enabled end)
+                        if okE then promptEnabled = isE end
+                    end
+
+                    local isValid = isInstanceValid(orbInfo.instance) 
+                                and safeGetAttribute(orbInfo.instance, "Type") == "CommandmentFragment"
+                                and isInstanceValid(orbInfo.root)
+                                and isInstanceValid(orbInfo.prompt)
+                                and promptEnabled
+                                and (not orbInfo.expireAt or (orbInfo.expireAt - getServerTime() > 0))
+                    
+                    if isValid and not State.trialAvailable and not State.trialActive then
+                        if not orbInfo.recoveryAttempted then
+                            orbInfo.recoveryAttempted = true
+                            Logger.log("[ORB] Interaction unconfirmed. Initiating single recovery phase.", "warn")
+                            StateMachine.clearCurrentAction("interaction_unconfirmed")
+                            if State.OrbRecoveryPosition then
+                                StateMachine.setOrbState("RECOVERY_PENDING")
+                            else
+                                StateMachine.setOrbState("RECOVERY_READY")
+                            end
+                            return
+                        else
+                            orbInfo.blocked = true
+                            Logger.log("[ORB] Recovery failed. Interaction unconfirmed twice. Orb blocked.", "error")
+                            State.LastError = "Orb interaction unconfirmed"
+                            StateMachine.clearCurrentAction("recovery_failed")
+                            
+                            Detection.updateOrbStateAfterChange()
+                            if State.SafeReturnPosition then
+                                ActionController.RequestFailsafeReturn()
+                            end
+                            return
+                        end
+                    end
+                end
+            end
+
+        elseif not success and State.CurrentAction.attemptId == attemptId and not State.CurrentAction.cancelled then
             Logger.log("[ACTION] COLLECT_ORB adapter returned: " .. (reason or "unknown"), "warn")
 
             -- ORB RECOVERY LOGIC (Target Not Reached)
             if reason == "target_not_reached" then
-                -- Revalidate the exact same orb specifically before triggering recovery
+                -- Revalidate the exact same orb including Enabled property
+                local promptEnabled = true
+                if isInstanceValid(orbInfo.prompt) then
+                    local okE, isE = pcall(function() return orbInfo.prompt.Enabled end)
+                    if okE then promptEnabled = isE end
+                end
+
                 local isValid = isInstanceValid(orbInfo.instance) 
                             and safeGetAttribute(orbInfo.instance, "Type") == "CommandmentFragment"
                             and isInstanceValid(orbInfo.root)
                             and isInstanceValid(orbInfo.prompt)
+                            and promptEnabled
                             and (not orbInfo.expireAt or (orbInfo.expireAt - getServerTime() > 0))
                 
-                if isValid then
+                if isValid and not State.trialAvailable and not State.trialActive then
                     if not orbInfo.recoveryAttempted then
                         orbInfo.recoveryAttempted = true
                         Logger.log("[ORB] Target not reached. Initiating single recovery phase.", "warn")
@@ -1264,13 +1331,21 @@ function ActionController.checkTimeout()
         if actionName == "COLLECT_ORB" then
             local orbInfo = State.CurrentAction.targetItem
             if orbInfo then
+                -- Revalidate the exact same orb including Enabled property
+                local promptEnabled = true
+                if isInstanceValid(orbInfo.prompt) then
+                    local okE, isE = pcall(function() return orbInfo.prompt.Enabled end)
+                    if okE then promptEnabled = isE end
+                end
+
                 local isValid = isInstanceValid(orbInfo.instance) 
                             and safeGetAttribute(orbInfo.instance, "Type") == "CommandmentFragment"
                             and isInstanceValid(orbInfo.root)
                             and isInstanceValid(orbInfo.prompt)
+                            and promptEnabled
                             and (not orbInfo.expireAt or (orbInfo.expireAt - getServerTime() > 0))
 
-                if isValid then
+                if isValid and not State.trialAvailable and not State.trialActive then
                     if not orbInfo.recoveryAttempted then
                         orbInfo.recoveryAttempted = true
                         Logger.log("[ORB] Interaction timeout. Initiating single recovery phase.", "warn")
@@ -2015,6 +2090,11 @@ end
 function Detection.handleTrialFinished()
     if State.HubClosed then return end
 
+    -- GUARD: Do not process removal if no Trial was ever confirmed and we are IDLE
+    if not State._hadConfirmedTimeTrial and State.MainState == "IDLE" then
+        return
+    end
+
     -- Guard against double processing
     if State.MainState ~= "TRIAL_ENDING" and State.MainState ~= "TRIAL_ACTIVE" then
         -- Already processed or not in trial
@@ -2452,6 +2532,39 @@ function Detection.resetState()
 end
 
 -- ════════════════════════════════════════════════════════════════
+-- SECTION 13.5: ANTI-AFK SUBSYSTEM
+-- ════════════════════════════════════════════════════════════════
+
+local AntiAfkSystem = {
+    lastActivity = tick(),
+}
+
+function AntiAfkSystem.init()
+    connect(UserInputService.InputBegan, function()
+        AntiAfkSystem.lastActivity = tick()
+    end, "antiafk")
+
+    connect(UserInputService.InputEnded, function()
+        AntiAfkSystem.lastActivity = tick()
+    end, "antiafk")
+
+    task.spawn(function()
+        while not State.HubClosed do
+            task.wait(1)
+            if State.AntiAfkEnabled then
+                if tick() - AntiAfkSystem.lastActivity >= Config.AntiAfkInterval then
+                    local success = Actions.AntiAfkPulse()
+                    if success then
+                        Logger.log("[ANTI-AFK] keep-alive pulse", "system")
+                        AntiAfkSystem.lastActivity = tick()
+                    end
+                end
+            end
+        end
+    end)
+end
+
+-- ════════════════════════════════════════════════════════════════
 -- SECTION 13: GUI CONSTRUCTION
 -- ════════════════════════════════════════════════════════════════
 
@@ -2729,7 +2842,8 @@ function GuiModule.build()
             Arbiter.evaluate() 
         else
             State._pendingRecoveryLog = false
-            if State.CurrentAction.name == "FARM_TRIAL" then
+            local act = State.CurrentAction.name
+            if act == "FARM_TRIAL" or act == "COLLECT_ORB" or act == "ORB_RECOVERY_STAGE" or act == "RETURN_TO_SAFE" or act == "FAILSAFE_RETURN" or act == "ENTER_TRIAL" then
                 ActionController.CancelCurrent("automation_master_off")
             end
         end
@@ -2738,7 +2852,10 @@ function GuiModule.build()
     GuiRefs.TogAutoJoin, GuiRefs.SetAutoJoin = createToggle(togglesPanel, halfW + 10, 38, halfW, "Auto Join", State.AutoJoinTrial, function(on)
         State.AutoJoinTrial = on
         Logger.log("[SYSTEM] Auto Join Trial " .. (on and "ON" or "OFF"), "system")
-        if on then Arbiter.evaluate() end
+        if on then 
+            if State.MonitorTrial then Detection.snapshotTrial() end
+            Arbiter.evaluate() 
+        end
     end)
 
     GuiRefs.TogAutoTrial, GuiRefs.SetAutoTrial = createToggle(togglesPanel, halfW + 10, 58, halfW, "Auto Trial", State.AutoTrial, function(on)
@@ -2759,7 +2876,22 @@ function GuiModule.build()
     GuiRefs.TogAutoOrb, GuiRefs.SetAutoOrb = createToggle(togglesPanel, halfW + 10, 78, halfW, "Auto Orb", State.AutoOrb, function(on)
         State.AutoOrb = on
         Logger.log("[SYSTEM] Auto Orb " .. (on and "ON" or "OFF"), "system")
-        if on then Arbiter.evaluate() end
+        if on then 
+            Arbiter.evaluate() 
+        else
+            local act = State.CurrentAction.name
+            if act == "COLLECT_ORB" or act == "ORB_RECOVERY_STAGE" or act == "RETURN_TO_SAFE" or act == "FAILSAFE_RETURN" then
+                ActionController.CancelCurrent("auto_orb_off")
+            end
+        end
+    end)
+    
+    GuiRefs.TogAntiAfk, GuiRefs.SetAntiAfk = createToggle(togglesPanel, halfW + 10, 98, halfW, "Anti AFK", State.AntiAfkEnabled, function(on)
+        State.AntiAfkEnabled = on
+        Logger.log("[SYSTEM] Anti AFK " .. (on and "ON" or "OFF"), "system")
+        if on then
+            AntiAfkSystem.lastActivity = tick()
+        end
     end)
 
     -- Return After Orb toggle (left column row 3)
@@ -3463,6 +3595,9 @@ local function initialize()
             end
         end
     end)
+
+    -- 8. Init Anti-AFK
+    AntiAfkSystem.init()
 
     Logger.log("[SYSTEM] HUB initialized — Main: " .. State.MainState .. " | Orb: " .. State.OrbState, "system")
     Logger.log("[SYSTEM] All systems active — Raid guard ON, lifecycle farm, distance-verified orb", "system")

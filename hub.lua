@@ -975,6 +975,14 @@ function ActionController.RequestEnterTrial()
         -- Confirmation layer handles that via observed signals.
         if not success and State.CurrentAction.attemptId == attemptId and not State.CurrentAction.cancelled then
             Logger.log("[ACTION] ENTER_TRIAL adapter returned: " .. (reason or "unknown"), "warn")
+            State._actionCooldowns.ENTER_TRIAL = tick() + Config.ActionRetryCooldown
+            StateMachine.clearCurrentAction("adapter_failed")
+            Detection.revalidateStatesFromObservation()
+            task.delay(Config.ActionRetryCooldown + 0.1, function()
+                if not State.HubClosed then
+                    Arbiter.evaluate()
+                end
+            end)
         end
     end)
 
@@ -1437,9 +1445,22 @@ function ActionController.RequestReturnToSafe()
         if success and State.CurrentAction.attemptId == attemptId then
             Logger.log("[ACTION] RETURN_TO_SAFE completed", "action")
             StateMachine.clearCurrentAction("return_completed")
+            
+            -- STALE STATE CLEANUP
+            if State.OrbState == "COLLECTED" and not Detection.getActiveOrb() then
+                StateMachine.setOrbState("NONE")
+            end
         elseif not success and State.CurrentAction.attemptId == attemptId
             and not State.CurrentAction.cancelled then
             Logger.log("[ACTION] RETURN_TO_SAFE failed: " .. (reason or "unknown"), "warn")
+            State._actionCooldowns.RETURN_TO_SAFE = tick() + Config.ActionRetryCooldown
+            StateMachine.clearCurrentAction("return_failed")
+            Detection.revalidateStatesFromObservation()
+            task.delay(Config.ActionRetryCooldown + 0.1, function()
+                if not State.HubClosed then
+                    Arbiter.evaluate()
+                end
+            end)
         end
     end)
 
@@ -1514,14 +1535,24 @@ function Arbiter.evaluate()
     if State.HubClosed then return end
 
     -- Check for preemption: if an Orb action is pending and Trial appeared
-    if State.CurrentAction.name == "COLLECT_ORB" or State.CurrentAction.name == "ORB_RECOVERY_STAGE" or State.CurrentAction.name == "FAILSAFE_RETURN" then
+    if State.CurrentAction.name == "COLLECT_ORB" 
+        or State.CurrentAction.name == "ORB_RECOVERY_STAGE" 
+        or State.CurrentAction.name == "RETURN_TO_SAFE"
+        or State.CurrentAction.name == "FAILSAFE_RETURN" then
         if State.trialAvailable or State.trialActive
             or State.MainState == "TRIAL_AVAILABLE"
             or State.MainState == "TRIAL_ENTERING"
             or State.MainState == "TRIAL_ACTIVE" then
             Logger.log("[DECISION] Trial preempted pending action", "decision")
             ActionController.CancelCurrent("trial_preemption")
-            return -- will be re-evaluated after cancel
+            
+            -- Defer re-evaluation so the Arbiter immediately catches the Trial state
+            task.defer(function()
+                if not State.HubClosed then
+                    Arbiter.evaluate()
+                end
+            end)
+            return
         end
     end
 
@@ -2090,16 +2121,9 @@ end
 function Detection.handleTrialFinished()
     if State.HubClosed then return end
 
-    -- GUARD: Do not process removal if no Trial was ever confirmed and we are IDLE
-    if not State._hadConfirmedTimeTrial and State.MainState == "IDLE" then
-        return
-    end
-
-    -- Guard against double processing
-    if State.MainState ~= "TRIAL_ENDING" and State.MainState ~= "TRIAL_ACTIVE" then
-        -- Already processed or not in trial
-        if State.MainState == "POST_TRIAL" then return end
-    end
+    -- GUARD: Strictly require confirmed time trial lifecycle AND proper main state
+    if not State._hadConfirmedTimeTrial then return end
+    if State.MainState ~= "TRIAL_ACTIVE" and State.MainState ~= "TRIAL_ENDING" then return end
 
     State.trialActive = false
     State.trialAvailable = false
@@ -2437,6 +2461,7 @@ function Detection.revalidateStatesFromObservation()
                     State.trialActive = true
                     State.trialModeName = cname
                     State._trialEntryProcessed = true
+                    State._hadConfirmedTimeTrial = true
                     break
                 end
             end
@@ -2817,6 +2842,10 @@ function GuiModule.build()
             Arbiter.evaluate()
         else
             Logger.log("[SYSTEM] Monitor Trial OFF", "system")
+            local act = State.CurrentAction.name
+            if act == "ENTER_TRIAL" or act == "FARM_TRIAL" then
+                ActionController.CancelCurrent("monitor_trial_off")
+            end
         end
     end)
 
@@ -2828,6 +2857,10 @@ function GuiModule.build()
             Detection.updateOrbStateAfterChange()
         else
             Logger.log("[SYSTEM] Monitor Orb OFF", "system")
+            local act = State.CurrentAction.name
+            if act == "COLLECT_ORB" or act == "ORB_RECOVERY_STAGE" or act == "RETURN_TO_SAFE" or act == "FAILSAFE_RETURN" then
+                ActionController.CancelCurrent("monitor_orb_off")
+            end
         end
     end)
 
@@ -2855,6 +2888,10 @@ function GuiModule.build()
         if on then 
             if State.MonitorTrial then Detection.snapshotTrial() end
             Arbiter.evaluate() 
+        else
+            if State.CurrentAction.name == "ENTER_TRIAL" then
+                ActionController.CancelCurrent("auto_join_off")
+            end
         end
     end)
 

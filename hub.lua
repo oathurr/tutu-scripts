@@ -42,6 +42,7 @@ local Refs = {
     Invite = nil,
     Gamemode = nil,
     SpawnItems = nil,        -- workspace._SPAWNITEMS
+    BoundSpawnItems = nil,   -- Explicitly tracked to handle recreations
     EnemiesGamemode = nil,   -- workspace._ENEMIES.Server.Gamemode
     Character = nil,
     HumanoidRootPart = nil,
@@ -534,22 +535,9 @@ end
 -- ════════════════════════════════════════════════════════════════
 -- SECTION 7: ACTION ADAPTERS
 -- ════════════════════════════════════════════════════════════════
--- These adapters isolate concrete gameplay actions.
--- They perform the PHYSICAL action only; confirmation is handled
--- by the Detection/Confirmation layer observing game signals.
---
--- In Roblox Studio / test harness: these can be replaced with
--- mock implementations or injected callbacks. The rest of the
--- architecture does not depend on their internals.
 
 local Actions = {}
 
---[[
-    EnterTrial:
-    Scans the Invite GUI strictly for the intended Time Trial Confirm button.
-    It rejects the structural Template and enforces exact naming ("Confirm")
-    and explicit gamemode ancestor verification.
-]]
 function Actions.EnterTrial(context)
     if context.isCancelled() then return false, "cancelled" end
 
@@ -643,15 +631,6 @@ function Actions.EnterTrial(context)
     return true, "click_dispatched"
 end
 
---[[
-    FarmTrial:
-    Lifecycle worker that loops through enemies inside the confirmed
-    trial container. Runs continuously until cancelled by detection.
-    Does NOT assume Humanoid on enemies.
-    Checks HumanoidRootPart > PrimaryPart > first BasePart.
-    The concrete movement/attack logic is in this adapter and can
-    be replaced for Studio testing.
-]]
 function Actions.FarmTrial(context)
     if context.isCancelled() then return false, "cancelled" end
 
@@ -748,17 +727,6 @@ function Actions.FarmTrial(context)
     return true, "loop_ended"
 end
 
---[[
-    CollectOrb:
-    1. Revalidates the orb item, Root, and ProximityPrompt.
-    2. Measures distance BEFORE move.
-    3. Requests move to orb position (adapter-level).
-    4. Measures distance AFTER move to confirm TARGET_REACHED.
-    5. If not reached, retries up to Config.OrbMoveMaxRetries.
-    6. Only proceeds to interaction after TARGET_REACHED.
-    7. Fires ProximityPrompt interaction (adapter-level).
-    Actual collection confirmed by Confirmation Layer.
-]]
 function Actions.CollectOrb(context)
     if context.isCancelled() then return false, "cancelled" end
 
@@ -917,12 +885,6 @@ function Actions.CollectOrb(context)
     return true, "prompt_fired"
 end
 
---[[
-    ReturnToSafePosition:
-    Moves the character back to a safe location.
-    If context.targetCFrame is provided, it uses that (for standalone staging).
-    Otherwise, it defaults purely to State.SafeReturnPosition.
-]]
 function Actions.ReturnToSafePosition(context)
     if context.isCancelled() then return false, "cancelled" end
 
@@ -951,11 +913,6 @@ function Actions.ReturnToSafePosition(context)
     return true, "returned"
 end
 
---[[
-    AntiAfkPulse:
-    Isolated keep-alive mechanism to prevent idle disconnection.
-    No gameplay logic inside this adapter.
-]]
 function Actions.AntiAfkPulse()
     local ok, vu = pcall(function() return game:GetService("VirtualUser") end)
     if ok and vu then
@@ -1832,21 +1789,16 @@ function Detection.getActiveOrbCount()
 end
 
 --- Inspect a single item from _SPAWNITEMS.
-function Detection.inspectSpawnItem(item)
+function Detection.inspectSpawnItem(item, attempt)
     if State.HubClosed then return end
     if not isInstanceValid(item) then return end
 
     -- Already tracked?
     if State.ObservedSpawnItems[item] then return end
 
-    -- Check identity
+    attempt = attempt or 1
+
     local itemType = safeGetAttribute(item, "Type")
-    if itemType ~= "CommandmentFragment" then return end
-
-    -- Secondary confirmation
-    local spawnId = safeGetAttribute(item, "SpawnId")
-    -- SpawnId == "Commandments" is secondary, not strictly required
-
     local expireAt = safeGetAttribute(item, "ExpireAt")
     local root = nil
     local prompt = nil
@@ -1858,6 +1810,22 @@ function Detection.inspectSpawnItem(item)
         if ok2 and p then
             prompt = p
         end
+    end
+
+    -- Delay evaluation safely if properties are not fully replicated during ChildAdded
+    if itemType ~= "CommandmentFragment" or not root or not prompt then
+        if attempt < 10 then
+            task.delay(0.5, function()
+                if State.MonitorOrb then
+                    Detection.inspectSpawnItem(item, attempt + 1)
+                end
+            end)
+        end
+        return
+    end
+
+    if attempt > 1 then
+        Logger.log("[ORB] delayed spawn metadata confirmed", "info")
     end
 
     -- Get position
@@ -2302,6 +2270,7 @@ function Detection.handleTrialFinished()
                 StateMachine.setOrbState("AVAILABLE")
                 Logger.log("[ORB] Commandment Fragment still available after Trial", "orb")
             else
+                Logger.log("[ORB] No client-visible Commandment Fragment after Trial", "orb")
                 -- Clean up any stale references
                 for inst, info in pairs(State.ObservedSpawnItems) do
                     if not isInstanceValid(inst) and not info.removed and not info.collected then
@@ -2309,7 +2278,7 @@ function Detection.handleTrialFinished()
                         Detection.cleanupOrbInfo(info)
                     end
                 end
-                if State.OrbState == "PENDING" then
+                if State.OrbState == "PENDING" or State.OrbState == "COLLECT_ATTEMPT" then
                     StateMachine.setOrbState("NONE")
                 end
             end
@@ -2437,8 +2406,6 @@ end
 function Detection.bindSpawnItems()
     if State.HubClosed then return end
 
-    disconnectByTag("spawnitems")
-
     local si = resolveSpawnItems()
     if not si then
         Logger.log("[SYSTEM] Waiting for _SPAWNITEMS...", "system")
@@ -2448,21 +2415,27 @@ function Detection.bindSpawnItems()
                 Refs.SpawnItems = child
                 disconnectByTag("spawnitems_wait")
                 Detection.bindSpawnItems()
-                -- Snapshot existing items
-                if State.MonitorOrb then
-                    Detection.snapshotOrbs()
-                end
             end
         end, "spawnitems_wait")
         return
     end
 
+    if Refs.BoundSpawnItems == si then return end
+
+    local isFirstBind = (Refs.BoundSpawnItems == nil)
+    
+    if not isFirstBind then
+        Logger.log("[ORB] _SPAWNITEMS instance changed — rebinding", "info")
+        disconnectByTag("spawnitems")
+    end
+
+    Refs.BoundSpawnItems = si
+
     connect(si.ChildAdded, function(child)
         if State.HubClosed then return end
         if not State.MonitorOrb then return end
-        -- Small yield to let attributes replicate
         task.defer(function()
-            Detection.inspectSpawnItem(child)
+            Detection.inspectSpawnItem(child, 1)
         end)
     end, "spawnitems")
 
@@ -2470,7 +2443,13 @@ function Detection.bindSpawnItems()
         Detection.handleSpawnItemRemoved(child)
     end, "spawnitems")
 
-    Logger.log("[SYSTEM] _SPAWNITEMS bound", "system")
+    if State.MonitorOrb and not isFirstBind then
+        Detection.snapshotOrbs()
+    end
+
+    if isFirstBind then
+        Logger.log("[SYSTEM] _SPAWNITEMS bound", "system")
+    end
 end
 
 --- Bind character references and handle respawns.
@@ -2521,7 +2500,9 @@ function Detection.snapshotTrial()
             for _, child in ipairs(children) do
                 local cok, cname = pcall(function() return child.Name end)
                 if cok and cname:lower():find("time trial", 1, true) then
-                    if not State.trialActive then
+                    if State.MainState == "TRIAL_ENDING" or State.MainState == "POST_TRIAL" then
+                        Logger.log("[TRIAL] preserving " .. State.MainState .. " during residual container observation", "trial")
+                    elseif not State.trialActive then
                         State.trialActive = true
                         State.trialModeName = cname
                         State._trialEntryProcessed = true
@@ -2568,6 +2549,10 @@ function Detection.snapshotOrbs()
     local si = resolveSpawnItems()
     if not si then return end
 
+    if Refs.BoundSpawnItems ~= si then
+        Detection.bindSpawnItems()
+    end
+
     local ok, children = pcall(function() return si:GetChildren() end)
     if not ok then return end
 
@@ -2580,16 +2565,15 @@ end
 function Detection.revalidateStatesFromObservation()
     if State.HubClosed then return end
 
-    -- Reset transient flags
-    State._trialEntryProcessed = false
-    State._trialEndProcessed = false
+    local wasEndingPhase = (State.MainState == "TRIAL_ENDING" or State.MainState == "POST_TRIAL")
 
-    -- Check trial from scratch
-    State.trialAvailable = false
-    State.trialActive = false
-    State.trialModeName = ""
+    if not wasEndingPhase then
+        State._trialEntryProcessed = false
+        State._trialEndProcessed = false
+    end
 
-    -- Check active trial
+    local observedTrialActive = false
+    local observedTrialName = ""
     local gm = resolveEnemiesGamemode()
     if gm then
         local ok, children = pcall(function() return gm:GetChildren() end)
@@ -2597,37 +2581,54 @@ function Detection.revalidateStatesFromObservation()
             for _, child in ipairs(children) do
                 local cok, cname = pcall(function() return child.Name end)
                 if cok and cname:lower():find("time trial", 1, true) then
-                    State.trialActive = true
-                    State.trialModeName = cname
-                    State._trialEntryProcessed = true
-                    State._hadConfirmedTimeTrial = true
+                    observedTrialActive = true
+                    observedTrialName = cname
                     break
                 end
             end
         end
     end
 
-    -- Check invite
     local invite = resolveInvite()
+    local observedTrialAvailable = false
     if invite then
         local ok, enabled = pcall(function() return invite.Enabled end)
         if ok and enabled then
             if hasTextContaining(invite, "time trial") then
-                State.trialAvailable = true
+                observedTrialAvailable = true
             end
         end
     end
 
-    -- Set MainState from observations
-    if State.trialActive then
-        State.MainState = "TRIAL_ACTIVE"
-    elseif State.trialAvailable then
-        State.MainState = "TRIAL_AVAILABLE"
+    if observedTrialActive then
+        if wasEndingPhase then
+            Logger.log("[TRIAL] preserving " .. State.MainState .. " during residual container observation", "trial")
+            State.trialActive = true
+            State.trialModeName = observedTrialName
+        else
+            State.trialActive = true
+            State.trialModeName = observedTrialName
+            State._trialEntryProcessed = true
+            State._hadConfirmedTimeTrial = true
+            State.MainState = "TRIAL_ACTIVE"
+        end
     else
-        State.MainState = "IDLE"
+        State.trialActive = false
+        if not wasEndingPhase then
+            State.trialModeName = ""
+        end
+        
+        if wasEndingPhase then
+            -- Leave MainState strictly protected
+        elseif observedTrialAvailable then
+            State.trialAvailable = true
+            State.MainState = "TRIAL_AVAILABLE"
+        else
+            State.trialAvailable = false
+            State.MainState = "IDLE"
+        end
     end
 
-    -- Update OrbState
     Detection.updateOrbStateAfterChange()
 end
 
@@ -2802,7 +2803,7 @@ function GuiModule.build()
     tbFill.Position = UDim2.new(0, 0, 1, -8)
     tbFill.BackgroundColor3 = COLORS.titleBar
     tbFill.BorderSizePixel = 0
-    tbFill.Parent = tbFill.Parent
+    tbFill.Parent = titleBar
 
     local titleLabel = Instance.new("TextLabel")
     titleLabel.Size = UDim2.new(1, -60, 1, 0)
@@ -3682,6 +3683,7 @@ function GuiModule.close()
         Invite = nil,
         Gamemode = nil,
         SpawnItems = nil,
+        BoundSpawnItems = nil,
         EnemiesGamemode = nil,
         Character = nil,
         HumanoidRootPart = nil,
@@ -3756,9 +3758,9 @@ local function initialize()
             if State.HubClosed then break end
 
             -- Re-resolve missing refs without spamming logs
-            if not Refs.SpawnItems or not isInstanceValid(Refs.SpawnItems) then
-                local si = resolveSpawnItems()
-                if si then
+            local currentSpawnItems = resolveSpawnItems()
+            if currentSpawnItems ~= Refs.BoundSpawnItems or not isInstanceValid(Refs.BoundSpawnItems) then
+                if currentSpawnItems then
                     Detection.bindSpawnItems()
                     if State.MonitorOrb then
                         Detection.snapshotOrbs()

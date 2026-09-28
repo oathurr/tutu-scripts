@@ -31,6 +31,7 @@ getgenv().__ANIME_BREAKERS_FINAL_HUB = true
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
+local HttpService = game:GetService("HttpService")
 
 local LocalPlayer = Players.LocalPlayer
 local Workspace = game:GetService("Workspace")
@@ -408,6 +409,126 @@ local function resolveCharacter()
         return char
     end
     return nil
+end
+
+-- ════════════════════════════════════════════════════════════════
+-- SECTION 6.5: PERSISTENCE
+-- ════════════════════════════════════════════════════════════════
+
+local Persistence = {}
+local FOLDER_NAME = "AnimeBreakersHub"
+local FILE_NAME = FOLDER_NAME .. "/config.json"
+
+local _persErrLogged = {
+    api = false,
+    folder = false,
+    write = false,
+    read = false
+}
+
+local function serializeCFrame(cf)
+    if not cf then return nil end
+    return {cf:GetComponents()}
+end
+
+local function deserializeCFrame(arr)
+    if type(arr) == "table" and #arr == 12 then
+        for i=1, 12 do
+            if type(arr[i]) ~= "number" then return nil end
+        end
+        return CFrame.new(unpack(arr))
+    end
+    return nil
+end
+
+function Persistence.save()
+    pcall(function()
+        if not writefile then
+            if not _persErrLogged.api then
+                Logger.log("[SYSTEM] Persistence API missing. Settings won't be saved.", "info")
+                _persErrLogged.api = true
+            end
+            return
+        end
+
+        if isfolder and makefolder and not isfolder(FOLDER_NAME) then
+            local fOk = pcall(function() makefolder(FOLDER_NAME) end)
+            if not fOk and not _persErrLogged.folder then
+                Logger.log("[SYSTEM] Failed to create settings folder.", "warn")
+                _persErrLogged.folder = true
+            end
+        end
+        
+        local data = {
+            MonitorTrial = State.MonitorTrial,
+            MonitorOrb = State.MonitorOrb,
+            AutomationMaster = State.AutomationMaster,
+            AutoJoinTrial = State.AutoJoinTrial,
+            AutoTrial = State.AutoTrial,
+            AutoOrb = State.AutoOrb,
+            ReturnAfterOrb = State.ReturnAfterOrb,
+            AntiAfkEnabled = State.AntiAfkEnabled,
+            SafeReturnPosition = serializeCFrame(State.SafeReturnPosition),
+            OrbRecoveryPosition = serializeCFrame(State.OrbRecoveryPosition),
+        }
+        
+        local wOk = pcall(function()
+            writefile(FILE_NAME, HttpService:JSONEncode(data))
+        end)
+        if not wOk and not _persErrLogged.write then
+            Logger.log("[SYSTEM] Failed to write settings file.", "warn")
+            _persErrLogged.write = true
+        end
+    end)
+end
+
+function Persistence.load()
+    pcall(function()
+        if not readfile or not isfile then
+            if not _persErrLogged.api then
+                Logger.log("[SYSTEM] Persistence API missing. Using defaults.", "info")
+                _persErrLogged.api = true
+            end
+            return
+        end
+
+        if isfile(FILE_NAME) then
+            local rOk, content = pcall(function() return readfile(FILE_NAME) end)
+            if not rOk then
+                if not _persErrLogged.read then
+                    Logger.log("[SYSTEM] Failed to read settings file.", "warn")
+                    _persErrLogged.read = true
+                end
+                return
+            end
+
+            local jOk, data = pcall(function() return HttpService:JSONDecode(content) end)
+            if not jOk then
+                if not _persErrLogged.read then
+                    Logger.log("[SYSTEM] Failed to decode settings file (corrupted).", "warn")
+                    _persErrLogged.read = true
+                end
+                return
+            end
+            
+            if type(data) == "table" then
+                if type(data.MonitorTrial) == "boolean" then State.MonitorTrial = data.MonitorTrial end
+                if type(data.MonitorOrb) == "boolean" then State.MonitorOrb = data.MonitorOrb end
+                if type(data.AutomationMaster) == "boolean" then State.AutomationMaster = data.AutomationMaster end
+                if type(data.AutoJoinTrial) == "boolean" then State.AutoJoinTrial = data.AutoJoinTrial end
+                if type(data.AutoTrial) == "boolean" then State.AutoTrial = data.AutoTrial end
+                if type(data.AutoOrb) == "boolean" then State.AutoOrb = data.AutoOrb end
+                if type(data.ReturnAfterOrb) == "boolean" then State.ReturnAfterOrb = data.ReturnAfterOrb end
+                if type(data.AntiAfkEnabled) == "boolean" then State.AntiAfkEnabled = data.AntiAfkEnabled end
+                
+                local safePos = deserializeCFrame(data.SafeReturnPosition)
+                if safePos then State.SafeReturnPosition = safePos end
+                
+                local recPos = deserializeCFrame(data.OrbRecoveryPosition)
+                if recPos then State.OrbRecoveryPosition = recPos end
+            end
+        end
+    end)
 end
 
 -- ════════════════════════════════════════════════════════════════
@@ -1050,7 +1171,25 @@ function ActionController.RequestFarmTrial()
             trialContainer = trialContainer,
         })
 
-        if not success and State.CurrentAction.attemptId == attemptId and not State.CurrentAction.cancelled then
+        if success and State.CurrentAction.attemptId == attemptId and not State.CurrentAction.cancelled then
+            if reason == "loop_ended" then
+                Logger.log("[ACTION] Trial worker ended unexpectedly", "warn")
+                StateMachine.clearCurrentAction("worker_ended")
+                Detection.revalidateStatesFromObservation()
+                
+                if State.trialActive and State.MainState == "TRIAL_ACTIVE" then
+                    if State.AutomationMaster and State.AutoTrial and State.MonitorTrial then
+                        Logger.log("[TRIAL] Trial still active. Scheduling worker recovery", "info")
+                        State._pendingRecoveryLog = true
+                        task.defer(function()
+                            if not State.HubClosed then
+                                Arbiter.evaluate()
+                            end
+                        end)
+                    end
+                end
+            end
+        elseif not success and State.CurrentAction.attemptId == attemptId and not State.CurrentAction.cancelled then
             Logger.log("[ACTION] FARM_TRIAL adapter returned: " .. (reason or "unknown"), "warn")
             State._actionCooldowns.FARM_TRIAL = tick() + Config.ActionRetryCooldown
             StateMachine.clearCurrentAction("adapter_failed")
@@ -2663,7 +2802,7 @@ function GuiModule.build()
     tbFill.Position = UDim2.new(0, 0, 1, -8)
     tbFill.BackgroundColor3 = COLORS.titleBar
     tbFill.BorderSizePixel = 0
-    tbFill.Parent = titleBar
+    tbFill.Parent = tbFill.Parent
 
     local titleLabel = Instance.new("TextLabel")
     titleLabel.Size = UDim2.new(1, -60, 1, 0)
@@ -2835,6 +2974,7 @@ function GuiModule.build()
 
     GuiRefs.TogMonTrial, GuiRefs.SetMonTrial = createToggle(togglesPanel, 4, 18, halfW, "Mon Trial", State.MonitorTrial, function(on)
         State.MonitorTrial = on
+        Persistence.save()
         if on then
             Logger.log("[SYSTEM] Monitor Trial ON — snapshotting", "system")
             Detection.snapshotTrial()
@@ -2851,6 +2991,7 @@ function GuiModule.build()
 
     GuiRefs.TogMonOrb, GuiRefs.SetMonOrb = createToggle(togglesPanel, 4, 38, halfW, "Mon Orb", State.MonitorOrb, function(on)
         State.MonitorOrb = on
+        Persistence.save()
         if on then
             Logger.log("[SYSTEM] Monitor Orb ON — snapshotting", "system")
             Detection.snapshotOrbs()
@@ -2868,6 +3009,7 @@ function GuiModule.build()
 
     GuiRefs.TogAutoMaster, GuiRefs.SetAutoMaster = createToggle(togglesPanel, halfW + 10, 18, halfW, "Master", State.AutomationMaster, function(on)
         State.AutomationMaster = on
+        Persistence.save()
         Logger.log("[SYSTEM] Automation Master " .. (on and "ON" or "OFF"), "system")
         if on then 
             if State.MonitorTrial then Detection.snapshotTrial() end
@@ -2884,6 +3026,7 @@ function GuiModule.build()
 
     GuiRefs.TogAutoJoin, GuiRefs.SetAutoJoin = createToggle(togglesPanel, halfW + 10, 38, halfW, "Auto Join", State.AutoJoinTrial, function(on)
         State.AutoJoinTrial = on
+        Persistence.save()
         Logger.log("[SYSTEM] Auto Join Trial " .. (on and "ON" or "OFF"), "system")
         if on then 
             if State.MonitorTrial then Detection.snapshotTrial() end
@@ -2897,6 +3040,7 @@ function GuiModule.build()
 
     GuiRefs.TogAutoTrial, GuiRefs.SetAutoTrial = createToggle(togglesPanel, halfW + 10, 58, halfW, "Auto Trial", State.AutoTrial, function(on)
         State.AutoTrial = on
+        Persistence.save()
         Logger.log("[SYSTEM] Auto Trial " .. (on and "ON" or "OFF"), "system")
         if on then 
             if State.MonitorTrial then Detection.snapshotTrial() end
@@ -2912,6 +3056,7 @@ function GuiModule.build()
 
     GuiRefs.TogAutoOrb, GuiRefs.SetAutoOrb = createToggle(togglesPanel, halfW + 10, 78, halfW, "Auto Orb", State.AutoOrb, function(on)
         State.AutoOrb = on
+        Persistence.save()
         Logger.log("[SYSTEM] Auto Orb " .. (on and "ON" or "OFF"), "system")
         if on then 
             Arbiter.evaluate() 
@@ -2925,6 +3070,7 @@ function GuiModule.build()
     
     GuiRefs.TogAntiAfk, GuiRefs.SetAntiAfk = createToggle(togglesPanel, halfW + 10, 98, halfW, "Anti AFK", State.AntiAfkEnabled, function(on)
         State.AntiAfkEnabled = on
+        Persistence.save()
         Logger.log("[SYSTEM] Anti AFK " .. (on and "ON" or "OFF"), "system")
         if on then
             AntiAfkSystem.lastActivity = tick()
@@ -2934,6 +3080,7 @@ function GuiModule.build()
     -- Return After Orb toggle (left column row 3)
     GuiRefs.TogReturnOrb, GuiRefs.SetReturnOrb = createToggle(togglesPanel, 4, 58, halfW, "Ret Orb", State.ReturnAfterOrb, function(on)
         State.ReturnAfterOrb = on
+        Persistence.save()
         Logger.log("[SYSTEM] Return After Orb " .. (on and "ON" or "OFF"), "system")
     end)
 
@@ -3260,6 +3407,7 @@ function GuiModule.build()
             local hrp = character:FindFirstChild("HumanoidRootPart")
             if hrp then
                 State.SafeReturnPosition = hrp.CFrame
+                Persistence.save()
                 local pos = hrp.Position
                 Logger.log(string.format("[POSITION] Safe Position fixed: %.0f, %.0f, %.0f",
                     pos.X, pos.Y, pos.Z), "action")
@@ -3279,6 +3427,7 @@ function GuiModule.build()
     -- ─── CLEAR FIXED POSITION ──────────────────────
     clearPosBtn.MouseButton1Click:Connect(function()
         State.SafeReturnPosition = nil
+        Persistence.save()
         Logger.log("[POSITION] Safe Position cleared", "action")
         if GuiRefs.FixedPosLabel then
             GuiRefs.FixedPosLabel.Text = "FixPos: NOT SET"
@@ -3293,6 +3442,7 @@ function GuiModule.build()
             local hrp = character:FindFirstChild("HumanoidRootPart")
             if hrp then
                 State.OrbRecoveryPosition = hrp.CFrame
+                Persistence.save()
                 local pos = hrp.Position
                 Logger.log(string.format("[POSITION] Orb Recovery Position fixed: %.0f, %.0f, %.0f",
                     pos.X, pos.Y, pos.Z), "action")
@@ -3312,6 +3462,7 @@ function GuiModule.build()
     -- ─── CLEAR ORBREC ──────────────────────
     clearOrbRecBtn.MouseButton1Click:Connect(function()
         State.OrbRecoveryPosition = nil
+        Persistence.save()
         Logger.log("[POSITION] Orb Recovery Position cleared", "action")
         if GuiRefs.OrbRecLabel then
             GuiRefs.OrbRecLabel.Text = "OrbRec: NOT SET"
@@ -3544,13 +3695,16 @@ end
 local function initialize()
     Logger.log("[SYSTEM] Initializing Anime Breakers HUB...", "system")
 
-    -- 1. Resolve PlayerGui
+    -- 1. Load Persisted Settings safely
+    Persistence.load()
+
+    -- 2. Resolve PlayerGui
     resolvePlayerGui()
 
-    -- 2. Build GUI (this also flushes the log buffer)
+    -- 3. Build GUI (this also flushes the log buffer)
     GuiModule.build()
 
-    -- 3. Resolve references
+    -- 4. Resolve references
     resolveInvite()
     resolveGamemodeGui()
     resolveSpawnItems()
@@ -3565,13 +3719,13 @@ local function initialize()
     Logger.log("[SYSTEM]   _ENEMIES.Server.Gamemode: " .. (Refs.EnemiesGamemode and "OK" or "MISSING"), "system")
     Logger.log("[SYSTEM]   Character: " .. (Refs.Character and "OK" or "MISSING"), "system")
 
-    -- 4. Bind detection listeners
+    -- 5. Bind detection listeners
     Detection.bindPlayerGui()
     Detection.bindGamemodeFolder()
     Detection.bindSpawnItems()
     Detection.bindCharacter()
 
-    -- 5. Initial snapshots (#50)
+    -- 6. Initial snapshots (#50)
     if State.MonitorTrial then
         Detection.snapshotTrial()
     end
@@ -3579,8 +3733,10 @@ local function initialize()
         Detection.snapshotOrbs()
         Detection.updateOrbStateAfterChange()
     end
+    Detection.recoverTrialWorkerIfNeeded()
+    Arbiter.evaluate()
 
-    -- 6. Start GUI update loop (~1 Hz)
+    -- 7. Start GUI update loop (~1 Hz)
     task.spawn(function()
         while not State.HubClosed do
             local ok, err = pcall(function()
@@ -3593,7 +3749,7 @@ local function initialize()
         end
     end)
 
-    -- 7. Retry missing containers periodically
+    -- 8. Retry missing containers periodically
     task.spawn(function()
         while not State.HubClosed do
             task.wait(Config.ContainerResolveRetry)
@@ -3633,7 +3789,7 @@ local function initialize()
         end
     end)
 
-    -- 8. Init Anti-AFK
+    -- 9. Init Anti-AFK
     AntiAfkSystem.init()
 
     Logger.log("[SYSTEM] HUB initialized — Main: " .. State.MainState .. " | Orb: " .. State.OrbState, "system")

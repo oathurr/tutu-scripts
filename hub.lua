@@ -42,7 +42,6 @@ local Refs = {
     Invite = nil,
     Gamemode = nil,
     SpawnItems = nil,        -- workspace._SPAWNITEMS
-    BoundSpawnItems = nil,   -- Explicitly tracked to handle recreations
     EnemiesGamemode = nil,   -- workspace._ENEMIES.Server.Gamemode
     Character = nil,
     HumanoidRootPart = nil,
@@ -1789,16 +1788,21 @@ function Detection.getActiveOrbCount()
 end
 
 --- Inspect a single item from _SPAWNITEMS.
-function Detection.inspectSpawnItem(item, attempt)
+function Detection.inspectSpawnItem(item)
     if State.HubClosed then return end
     if not isInstanceValid(item) then return end
 
     -- Already tracked?
     if State.ObservedSpawnItems[item] then return end
 
-    attempt = attempt or 1
-
+    -- Check identity
     local itemType = safeGetAttribute(item, "Type")
+    if itemType ~= "CommandmentFragment" then return end
+
+    -- Secondary confirmation
+    local spawnId = safeGetAttribute(item, "SpawnId")
+    -- SpawnId == "Commandments" is secondary, not strictly required
+
     local expireAt = safeGetAttribute(item, "ExpireAt")
     local root = nil
     local prompt = nil
@@ -1810,22 +1814,6 @@ function Detection.inspectSpawnItem(item, attempt)
         if ok2 and p then
             prompt = p
         end
-    end
-
-    -- Delay evaluation safely if properties are not fully replicated during ChildAdded
-    if itemType ~= "CommandmentFragment" or not root or not prompt then
-        if attempt < 10 then
-            task.delay(0.5, function()
-                if State.MonitorOrb then
-                    Detection.inspectSpawnItem(item, attempt + 1)
-                end
-            end)
-        end
-        return
-    end
-
-    if attempt > 1 then
-        Logger.log("[ORB] delayed spawn metadata confirmed", "info")
     end
 
     -- Get position
@@ -1944,6 +1932,15 @@ function Detection.handleOrbRemoved(orbInfo)
             State.OrbsLikelyExpired = State.OrbsLikelyExpired + 1
             Logger.log("[ORB] Likely expired", "orb")
             State.LastEvent = "ORB likely expired"
+            
+            -- NEW: Clear action if stuck on an expired orb
+            if State.CurrentAction.name == "COLLECT_ORB" and State.CurrentAction.targetItem == orbInfo then
+                Logger.log("[ACTION FAILED] COLLECT_ORB - target expired", "error")
+                State.LastError = "COLLECT_ORB item expired"
+                State._actionCooldowns.COLLECT_ORB = tick() + Config.ActionRetryCooldown
+                StateMachine.clearCurrentAction("target_expired")
+            end
+            
             StateMachine.setOrbState("LIKELY_EXPIRED")
             Detection.cleanupOrbInfo(orbInfo)
             Detection.updateOrbStateAfterChange()
@@ -2270,7 +2267,6 @@ function Detection.handleTrialFinished()
                 StateMachine.setOrbState("AVAILABLE")
                 Logger.log("[ORB] Commandment Fragment still available after Trial", "orb")
             else
-                Logger.log("[ORB] No client-visible Commandment Fragment after Trial", "orb")
                 -- Clean up any stale references
                 for inst, info in pairs(State.ObservedSpawnItems) do
                     if not isInstanceValid(inst) and not info.removed and not info.collected then
@@ -2278,7 +2274,7 @@ function Detection.handleTrialFinished()
                         Detection.cleanupOrbInfo(info)
                     end
                 end
-                if State.OrbState == "PENDING" or State.OrbState == "COLLECT_ATTEMPT" then
+                if State.OrbState == "PENDING" then
                     StateMachine.setOrbState("NONE")
                 end
             end
@@ -2406,6 +2402,8 @@ end
 function Detection.bindSpawnItems()
     if State.HubClosed then return end
 
+    disconnectByTag("spawnitems")
+
     local si = resolveSpawnItems()
     if not si then
         Logger.log("[SYSTEM] Waiting for _SPAWNITEMS...", "system")
@@ -2415,27 +2413,20 @@ function Detection.bindSpawnItems()
                 Refs.SpawnItems = child
                 disconnectByTag("spawnitems_wait")
                 Detection.bindSpawnItems()
+                -- Snapshot existing items
+                if State.MonitorOrb then
+                    Detection.snapshotOrbs()
+                end
             end
         end, "spawnitems_wait")
         return
     end
 
-    if Refs.BoundSpawnItems == si then return end
-
-    local isFirstBind = (Refs.BoundSpawnItems == nil)
-    
-    if not isFirstBind then
-        Logger.log("[ORB] _SPAWNITEMS instance changed — rebinding", "info")
-        disconnectByTag("spawnitems")
-    end
-
-    Refs.BoundSpawnItems = si
-
     connect(si.ChildAdded, function(child)
         if State.HubClosed then return end
         if not State.MonitorOrb then return end
         task.defer(function()
-            Detection.inspectSpawnItem(child, 1)
+            Detection.inspectSpawnItem(child)
         end)
     end, "spawnitems")
 
@@ -2443,13 +2434,7 @@ function Detection.bindSpawnItems()
         Detection.handleSpawnItemRemoved(child)
     end, "spawnitems")
 
-    if State.MonitorOrb and not isFirstBind then
-        Detection.snapshotOrbs()
-    end
-
-    if isFirstBind then
-        Logger.log("[SYSTEM] _SPAWNITEMS bound", "system")
-    end
+    Logger.log("[SYSTEM] _SPAWNITEMS bound", "system")
 end
 
 --- Bind character references and handle respawns.
@@ -2500,9 +2485,7 @@ function Detection.snapshotTrial()
             for _, child in ipairs(children) do
                 local cok, cname = pcall(function() return child.Name end)
                 if cok and cname:lower():find("time trial", 1, true) then
-                    if State.MainState == "TRIAL_ENDING" or State.MainState == "POST_TRIAL" then
-                        Logger.log("[TRIAL] preserving " .. State.MainState .. " during residual container observation", "trial")
-                    elseif not State.trialActive then
+                    if not State.trialActive then
                         State.trialActive = true
                         State.trialModeName = cname
                         State._trialEntryProcessed = true
@@ -2549,10 +2532,6 @@ function Detection.snapshotOrbs()
     local si = resolveSpawnItems()
     if not si then return end
 
-    if Refs.BoundSpawnItems ~= si then
-        Detection.bindSpawnItems()
-    end
-
     local ok, children = pcall(function() return si:GetChildren() end)
     if not ok then return end
 
@@ -2565,15 +2544,16 @@ end
 function Detection.revalidateStatesFromObservation()
     if State.HubClosed then return end
 
-    local wasEndingPhase = (State.MainState == "TRIAL_ENDING" or State.MainState == "POST_TRIAL")
+    -- Reset transient flags
+    State._trialEntryProcessed = false
+    State._trialEndProcessed = false
 
-    if not wasEndingPhase then
-        State._trialEntryProcessed = false
-        State._trialEndProcessed = false
-    end
+    -- Check trial from scratch
+    State.trialAvailable = false
+    State.trialActive = false
+    State.trialModeName = ""
 
-    local observedTrialActive = false
-    local observedTrialName = ""
+    -- Check active trial
     local gm = resolveEnemiesGamemode()
     if gm then
         local ok, children = pcall(function() return gm:GetChildren() end)
@@ -2581,54 +2561,37 @@ function Detection.revalidateStatesFromObservation()
             for _, child in ipairs(children) do
                 local cok, cname = pcall(function() return child.Name end)
                 if cok and cname:lower():find("time trial", 1, true) then
-                    observedTrialActive = true
-                    observedTrialName = cname
+                    State.trialActive = true
+                    State.trialModeName = cname
+                    State._trialEntryProcessed = true
+                    State._hadConfirmedTimeTrial = true
                     break
                 end
             end
         end
     end
 
+    -- Check invite
     local invite = resolveInvite()
-    local observedTrialAvailable = false
     if invite then
         local ok, enabled = pcall(function() return invite.Enabled end)
         if ok and enabled then
             if hasTextContaining(invite, "time trial") then
-                observedTrialAvailable = true
+                State.trialAvailable = true
             end
         end
     end
 
-    if observedTrialActive then
-        if wasEndingPhase then
-            Logger.log("[TRIAL] preserving " .. State.MainState .. " during residual container observation", "trial")
-            State.trialActive = true
-            State.trialModeName = observedTrialName
-        else
-            State.trialActive = true
-            State.trialModeName = observedTrialName
-            State._trialEntryProcessed = true
-            State._hadConfirmedTimeTrial = true
-            State.MainState = "TRIAL_ACTIVE"
-        end
+    -- Set MainState from observations
+    if State.trialActive then
+        State.MainState = "TRIAL_ACTIVE"
+    elseif State.trialAvailable then
+        State.MainState = "TRIAL_AVAILABLE"
     else
-        State.trialActive = false
-        if not wasEndingPhase then
-            State.trialModeName = ""
-        end
-        
-        if wasEndingPhase then
-            -- Leave MainState strictly protected
-        elseif observedTrialAvailable then
-            State.trialAvailable = true
-            State.MainState = "TRIAL_AVAILABLE"
-        else
-            State.trialAvailable = false
-            State.MainState = "IDLE"
-        end
+        State.MainState = "IDLE"
     end
 
+    -- Update OrbState
     Detection.updateOrbStateAfterChange()
 end
 
@@ -3683,7 +3646,6 @@ function GuiModule.close()
         Invite = nil,
         Gamemode = nil,
         SpawnItems = nil,
-        BoundSpawnItems = nil,
         EnemiesGamemode = nil,
         Character = nil,
         HumanoidRootPart = nil,
@@ -3758,9 +3720,9 @@ local function initialize()
             if State.HubClosed then break end
 
             -- Re-resolve missing refs without spamming logs
-            local currentSpawnItems = resolveSpawnItems()
-            if currentSpawnItems ~= Refs.BoundSpawnItems or not isInstanceValid(Refs.BoundSpawnItems) then
-                if currentSpawnItems then
+            if not Refs.SpawnItems or not isInstanceValid(Refs.SpawnItems) then
+                local si = resolveSpawnItems()
+                if si then
                     Detection.bindSpawnItems()
                     if State.MonitorOrb then
                         Detection.snapshotOrbs()

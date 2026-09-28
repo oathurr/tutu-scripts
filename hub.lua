@@ -1,16 +1,16 @@
 --[[
 ╔══════════════════════════════════════════════════════════════════╗
-║              ANIME BREAKERS FINAL HUB — LIVE                   ║
-║                                                                ║
-║  Architecture:                                                 ║
-║  Detection → State Store → Arbiter → Action Controller         ║
-║                                        ↓                      ║
-║                                   Action Adapters (LIVE)       ║
-║                                        ↓                      ║
-║                                  Confirmation Layer            ║
-║                                                                ║
-║  All adapters are fully implemented.                           ║
-║  Test environment — authorized by developer.                   ║
+║              ANIME BREAKERS FINAL HUB — LIVE                     ║
+║                                                                  ║
+║  Architecture:                                                   ║
+║  Detection → State Store → Arbiter → Action Controller           ║
+║                                        ↓                         ║
+║                                   Action Adapters (LIVE)         ║
+║                                        ↓                         ║
+║                                   Confirmation Layer             ║
+║                                                                  ║
+║  All adapters are fully implemented.                             ║
+║  Test environment — authorized by developer.                     ║
 ╚══════════════════════════════════════════════════════════════════╝
 ]]
 
@@ -52,9 +52,10 @@ local Refs = {
 
 local Config = {
     ActionTimeouts = {
-        EnterTrial   = 10,   -- per spec: 10s to confirm entry
-        FarmStartup  = 15,
-        CollectOrb   = 5,    -- per spec: 5s to confirm collection
+        EnterTrial       = 10,         -- 10s to confirm entry
+        FarmTrial        = math.huge,  -- lifecycle worker: no timeout, cancelled by detection
+        CollectOrb       = 15,         -- 15s total for move + interact + confirm
+        ReturnToSafe     = 10,         -- 10s to return to safe position
     },
     CollectConfirmWindow   = 5,    -- seconds to correlate Triggered + Removed
     PostTrialDebounce      = 3,    -- seconds before revalidation after trial end
@@ -67,6 +68,9 @@ local Config = {
     OrbExpireThreshold     = 2,    -- seconds: if remaining <= this at removal, likely expired
     FarmLoopInterval       = 0.1,  -- seconds between farm loop iterations
     OrbTeleportSettleTime  = 0.25, -- seconds to wait after teleport before firing prompt
+    OrbReachDistance       = 16,   -- studs: max distance to consider TARGET_REACHED
+    OrbMoveMaxRetries      = 3,    -- max move attempts before giving up
+    OrbMoveRetryWait       = 0.5,  -- seconds between retry attempts
 }
 
 -- ════════════════════════════════════════════════════════════════
@@ -97,6 +101,10 @@ local State = {
     AutoJoinTrial    = false,
     AutoTrial        = false,
     AutoOrb          = false,
+    ReturnAfterOrb   = false,
+
+    -- Safe Return Position (manual only)
+    SafeReturnPosition = nil, -- CFrame or nil
 
     -- Detection cache
     trialAvailable = false,
@@ -121,14 +129,17 @@ local State = {
     LastError  = "",
 
     -- Internal flags
-    HubClosed             = false,
-    _attemptCounter       = 0,
-    _trialEntryProcessed  = false,
-    _trialEndProcessed    = false,
-    _actionCooldowns      = {
-        ENTER_TRIAL = 0,
-        FARM_TRIAL  = 0,
-        COLLECT_ORB = 0,
+    HubClosed                 = false,
+    _attemptCounter           = 0,
+    _trialEntryProcessed      = false,
+    _trialEndProcessed        = false,
+    _hadConfirmedTimeTrial    = false,  -- true only when REAL Time Trial was confirmed
+    _pendingRecoveryLog       = false,  -- flag for valid trial worker recovery log
+    _actionCooldowns          = {
+        ENTER_TRIAL          = 0,
+        FARM_TRIAL           = 0,
+        COLLECT_ORB          = 0,
+        RETURN_TO_SAFE       = 0,
     },
     _pendingTasks = {},  -- tracked task.delay handles for cancellation
 }
@@ -395,22 +406,28 @@ local function resolveCharacter()
 end
 
 -- ════════════════════════════════════════════════════════════════
--- SECTION 7: ACTION ADAPTERS (LIVE)
+-- SECTION 7: ACTION ADAPTERS
 -- ════════════════════════════════════════════════════════════════
 -- These adapters isolate concrete gameplay actions.
--- All three are fully implemented for the authorized test environment.
 -- They perform the PHYSICAL action only; confirmation is handled
 -- by the Detection/Confirmation layer observing game signals.
+--
+-- In Roblox Studio / test harness: these can be replaced with
+-- mock implementations or injected callbacks. The rest of the
+-- architecture does not depend on their internals.
 
 local Actions = {}
 
 --[[
     EnterTrial:
-    Locates the confirmation TextButton inside PlayerGui.Invite
-    and fires its MouseButton1Click via firesignal.
-    The adapter returns true if the click was dispatched.
+    Locates the positive confirmation button inside PlayerGui.Invite.
+    Searches for ANY GuiButton (TextButton or ImageButton).
+    Identification heuristics:
+      1. TextButton with accept keywords (join/yes/enter/accept/confirm/ok)
+      2. ImageButton with green-ish BackgroundColor3
+    Fires MouseButton1Click on the identified button.
     Actual entry is NOT confirmed here — the Confirmation Layer
-    waits for Time Trial child / Gamemode.Enabled.
+    waits for Time Trial container in _ENEMIES.Server.Gamemode.
 ]]
 function Actions.EnterTrial(context)
     if context.isCancelled() then return false, "cancelled" end
@@ -425,78 +442,97 @@ function Actions.EnterTrial(context)
     local ok, enabled = pcall(function() return invite.Enabled end)
     if not ok or not enabled then return false, "invite_not_enabled" end
 
-    -- Scan for a clickable TextButton inside Invite.
-    -- The observed UI contains a confirmation button (e.g. with text
-    -- related to joining). We iterate descendants and look for any
-    -- Visible TextButton that is likely the accept/join button.
+    -- Scan for a clickable GuiButton (TextButton OR ImageButton).
     local targetButton = nil
     local ok2, descendants = pcall(function() return invite:GetDescendants() end)
     if not ok2 then return false, "cannot_scan_invite" end
 
     for _, desc in ipairs(descendants) do
         if context.isCancelled() then return false, "cancelled" end
-        if desc:IsA("TextButton") then
+        if desc:IsA("GuiButton") then  -- covers both TextButton and ImageButton
             local btnOk, btnVisible = pcall(function() return desc.Visible end)
             if btnOk and btnVisible then
-                -- Prefer a button whose text suggests acceptance/joining
-                local txtOk, btnText = pcall(function() return desc.Text end)
-                if txtOk and btnText then
-                    local lower = btnText:lower()
-                    -- Accept keywords: "join", "yes", "enter", "accept", "confirm", "ok"
-                    if lower:find("join", 1, true)
-                        or lower:find("yes", 1, true)
-                        or lower:find("enter", 1, true)
-                        or lower:find("accept", 1, true)
-                        or lower:find("confirm", 1, true)
-                        or lower:find("ok", 1, true) then
-                        targetButton = desc
-                        break
+                -- Strategy 1: TextButton with accept keywords
+                if desc:IsA("TextButton") then
+                    local txtOk, btnText = pcall(function() return desc.Text end)
+                    if txtOk and btnText then
+                        local lower = btnText:lower()
+                        if lower:find("join", 1, true)
+                            or lower:find("yes", 1, true)
+                            or lower:find("enter", 1, true)
+                            or lower:find("accept", 1, true)
+                            or lower:find("confirm", 1, true)
+                            or lower:find("ok", 1, true) then
+                            targetButton = desc
+                            break
+                        end
                     end
-                    -- Fallback: store any visible TextButton
-                    if not targetButton then
-                        targetButton = desc
+                end
+
+                -- Strategy 2: ImageButton with green-ish color (positive action)
+                if desc:IsA("ImageButton") then
+                    local colOk, bgColor = pcall(function() return desc.BackgroundColor3 end)
+                    if colOk and bgColor then
+                        -- Green detection: G channel significantly higher than R
+                        if bgColor.G > 0.4 and bgColor.G > bgColor.R * 1.3 then
+                            targetButton = desc
+                            break
+                        end
+                    end
+                    -- Also check Image name for check/accept patterns
+                    local imgOk, imgSrc = pcall(function() return desc.Image end)
+                    if imgOk and imgSrc and imgSrc ~= "" then
+                        local lowerImg = imgSrc:lower()
+                        if lowerImg:find("check", 1, true)
+                            or lowerImg:find("accept", 1, true)
+                            or lowerImg:find("confirm", 1, true)
+                            or lowerImg:find("yes", 1, true) then
+                            targetButton = desc
+                            break
+                        end
                     end
                 end
             end
         end
     end
 
-    if not targetButton then return false, "no_button_found" end
+    if not targetButton then 
+        Logger.log("[ACTION] EnterTrial: Cannot determine correct button safely", "warn")
+        return false, "ambiguous_button" 
+    end
 
     if context.isCancelled() then return false, "cancelled" end
 
-    -- Fire the button click
+    Logger.log("[ACTION] EnterTrial: firing " .. targetButton.ClassName .. " (" .. targetButton.Name .. ")", "action")
+
+    -- Fire the button click via MouseButton1Click signal
     local fireOk, fireErr = pcall(function()
         firesignal(targetButton.MouseButton1Click)
     end)
 
     if not fireOk then
-        -- Fallback: try alternative click methods
+        -- Fallback: try direct method if available
         local alt1 = pcall(function()
             fireclickdetector(targetButton)
         end)
         if not alt1 then
-            return false, "firesignal_failed: " .. tostring(fireErr)
+            Logger.log("[ACTION] EnterTrial: click dispatch failed, adapter needs injection", "warn")
+            return false, "click_dispatch_failed: " .. tostring(fireErr)
         end
     end
 
-    Logger.log("[ACTION] EnterTrial: button click dispatched (" .. tostring(targetButton.Name) .. ")", "action")
-    -- Success here means "click was sent". Actual entry is confirmed
-    -- by the Detection Layer when Time Trial child appears or
-    -- Gamemode.Enabled becomes true.
+    Logger.log("[ACTION] EnterTrial: button click dispatched", "action")
     return true, "click_dispatched"
 end
 
 --[[
     FarmTrial:
-    Loops through enemies inside the active trial container
-    (workspace._ENEMIES.Server.Gamemode["Time Trial_-1"]).
-    For each enemy model, teleports the LocalPlayer's character
-    to the enemy's position via CFrame.
-    Does NOT assume Humanoid/HumanoidRootPart on enemies.
-    Checks for HumanoidRootPart or PrimaryPart.
-    The loop runs continuously until cancelled by the cancel token
-    (trial ends or action is preempted).
+    Lifecycle worker that loops through enemies inside the confirmed
+    trial container. Runs continuously until cancelled by detection.
+    Does NOT assume Humanoid on enemies.
+    Checks HumanoidRootPart > PrimaryPart > first BasePart.
+    The concrete movement/attack logic is in this adapter and can
+    be replaced for Studio testing.
 ]]
 function Actions.FarmTrial(context)
     if context.isCancelled() then return false, "cancelled" end
@@ -545,19 +581,16 @@ function Actions.FarmTrial(context)
             local targetPart = nil
 
             if mob:IsA("Model") then
-                -- Priority 1: HumanoidRootPart
                 local okHrp, mobHrp = pcall(function()
                     return mob:FindFirstChild("HumanoidRootPart")
                 end)
                 if okHrp and mobHrp and mobHrp:IsA("BasePart") then
                     targetPart = mobHrp
                 else
-                    -- Priority 2: PrimaryPart
                     local okPP, pp = pcall(function() return mob.PrimaryPart end)
                     if okPP and pp and pp:IsA("BasePart") then
                         targetPart = pp
                     else
-                        -- Priority 3: First BasePart child (for hash-named parts)
                         local okDesc, children = pcall(function() return mob:GetChildren() end)
                         if okDesc then
                             for _, child in ipairs(children) do
@@ -577,20 +610,17 @@ function Actions.FarmTrial(context)
                 local okPos, targetPos = pcall(function() return targetPart.CFrame end)
                 if okPos and targetPos then
                     foundTarget = true
-                    -- Teleport player to enemy position (slightly offset to avoid overlap)
                     local okTp, tpErr = pcall(function()
                         hrp.CFrame = targetPos * CFrame.new(0, 0, 3)
                     end)
                     if not okTp then
                         Logger.log("[ACTION] FarmTrial: teleport error: " .. tostring(tpErr), "warn")
                     end
-                    -- Short wait between targets to allow game to process
                     task.wait(Config.FarmLoopInterval)
                 end
             end
         end
 
-        -- If no targets found in this iteration, wait before rescanning
         if not foundTarget then
             task.wait(0.3)
         end
@@ -602,13 +632,14 @@ end
 
 --[[
     CollectOrb:
-    1. Revalidates the orb item and its Root part still exist.
-    2. Teleports the LocalPlayer's CFrame to item.Root.Position.
-    3. Waits a short settle time (0.25s).
-    4. Fires fireproximityprompt on the ProximityPrompt.
-    The adapter returns true if the prompt was fired.
-    Actual collection is confirmed by the Confirmation Layer
-    (Triggered by LocalPlayer + same model removed).
+    1. Revalidates the orb item, Root, and ProximityPrompt.
+    2. Measures distance BEFORE move.
+    3. Requests move to orb position (adapter-level).
+    4. Measures distance AFTER move to confirm TARGET_REACHED.
+    5. If not reached, retries up to Config.OrbMoveMaxRetries.
+    6. Only proceeds to interaction after TARGET_REACHED.
+    7. Fires ProximityPrompt interaction (adapter-level).
+    Actual collection confirmed by Confirmation Layer.
 ]]
 function Actions.CollectOrb(context)
     if context.isCancelled() then return false, "cancelled" end
@@ -616,98 +647,149 @@ function Actions.CollectOrb(context)
     local orbInfo = context.item
     if not orbInfo then return false, "no_orb_info" end
 
-    -- Revalidate item
-    if not isInstanceValid(orbInfo.instance) then
-        return false, "item_destroyed"
-    end
-    if safeGetAttribute(orbInfo.instance, "Type") ~= "CommandmentFragment" then
-        return false, "type_mismatch"
+    -- === REVALIDATION BLOCK ===
+    local function revalidateOrb()
+        if not isInstanceValid(orbInfo.instance) then return false, "item_destroyed" end
+        if safeGetAttribute(orbInfo.instance, "Type") ~= "CommandmentFragment" then
+            return false, "type_mismatch"
+        end
+
+        -- Re-resolve Root if needed
+        if not orbInfo.root or not isInstanceValid(orbInfo.root) then
+            local okR, r = pcall(function() return orbInfo.instance:FindFirstChild("Root") end)
+            if okR and r then
+                orbInfo.root = r
+            else
+                return false, "root_destroyed"
+            end
+        end
+
+        -- Re-resolve ProximityPrompt if needed
+        if not orbInfo.prompt or not isInstanceValid(orbInfo.prompt) then
+            local okP, p = pcall(function()
+                return orbInfo.root:FindFirstChildOfClass("ProximityPrompt")
+            end)
+            if okP and p then
+                orbInfo.prompt = p
+            else
+                return false, "no_proximity_prompt"
+            end
+        end
+
+        -- Check ExpireAt
+        if orbInfo.expireAt then
+            local remaining = orbInfo.expireAt - getServerTime()
+            if remaining <= 0 then return false, "orb_already_expired" end
+        end
+
+        return true
     end
 
-    -- Revalidate Root
-    local root = orbInfo.root
-    if not root or not isInstanceValid(root) then
-        -- Try re-resolving
-        local okR, r = pcall(function() return orbInfo.instance:FindFirstChild("Root") end)
-        if okR and r then
-            root = r
-            orbInfo.root = r
+    -- Initial revalidation
+    local valid, reason = revalidateOrb()
+    if not valid then return false, reason end
+
+    -- === DISTANCE MEASUREMENT ===
+    local function getDistanceToOrb()
+        local character = LocalPlayer.Character
+        if not character then return math.huge end
+        local hrp = character:FindFirstChild("HumanoidRootPart")
+        if not hrp then return math.huge end
+        if not orbInfo.root or not isInstanceValid(orbInfo.root) then return math.huge end
+        local okP, orbPos = pcall(function() return orbInfo.root.Position end)
+        if not okP then return math.huge end
+        local okH, hrpPos = pcall(function() return hrp.Position end)
+        if not okH then return math.huge end
+        return (hrpPos - orbPos).Magnitude
+    end
+
+    -- === MOVE WITH RETRY ===
+    local reached = false
+    for attempt = 1, Config.OrbMoveMaxRetries do
+        if context.isCancelled() then return false, "cancelled" end
+
+        -- Revalidate on each attempt
+        valid, reason = revalidateOrb()
+        if not valid then return false, reason end
+
+        -- Check if trial appeared (preemption)
+        if State.trialAvailable or State.trialActive then
+            return false, "trial_preempted_during_move"
+        end
+
+        local distBefore = getDistanceToOrb()
+
+        -- Get fresh orb CFrame
+        local okPos, orbCFrame = pcall(function() return orbInfo.root.CFrame end)
+        if not okPos or not orbCFrame then return false, "cannot_read_position" end
+
+        -- Get character HRP
+        local character = LocalPlayer.Character
+        if not character then return false, "no_character" end
+        local hrp = character:FindFirstChild("HumanoidRootPart")
+        if not hrp then return false, "no_hrp" end
+
+        -- Request move
+        Logger.log(string.format("[ORB MOVE] attempt #%d | distance_before = %.1f", attempt, distBefore), "action")
+
+        local okTp, tpErr = pcall(function()
+            hrp.CFrame = orbCFrame * CFrame.new(0, 0, 2)
+        end)
+        if not okTp then
+            Logger.log("[ORB MOVE] move failed: " .. tostring(tpErr), "warn")
+        end
+
+        -- Wait for position to settle
+        task.wait(Config.OrbTeleportSettleTime)
+
+        if context.isCancelled() then return false, "cancelled_after_move" end
+
+        -- Measure distance AFTER move
+        local distAfter = getDistanceToOrb()
+        Logger.log(string.format("[ORB MOVE] distance_after = %.1f", distAfter), "action")
+
+        if distAfter <= Config.OrbReachDistance then
+            Logger.log("[ORB MOVE] target reached", "action")
+            reached = true
+            break
         else
-            return false, "root_destroyed"
+            Logger.log("[ORB MOVE] target not reached", "warn")
+            if attempt < Config.OrbMoveMaxRetries then
+                task.wait(Config.OrbMoveRetryWait)
+            end
         end
     end
 
-    -- Revalidate ProximityPrompt
-    local prompt = orbInfo.prompt
-    if not prompt or not isInstanceValid(prompt) then
-        local okP, p = pcall(function() return root:FindFirstChildOfClass("ProximityPrompt") end)
-        if okP and p then
-            prompt = p
-            orbInfo.prompt = p
-        else
-            return false, "no_proximity_prompt"
-        end
+    if not reached then
+        Logger.log("[ORB MOVE] failed to reach target after " .. Config.OrbMoveMaxRetries .. " attempts", "error")
+        return false, "target_not_reached"
     end
 
-    -- Check ExpireAt validity
-    if orbInfo.expireAt then
-        local remaining = orbInfo.expireAt - getServerTime()
-        if remaining <= 0 then
-            return false, "orb_already_expired"
-        end
-    end
+    -- === INTERACTION (only after TARGET_REACHED) ===
+    if context.isCancelled() then return false, "cancelled_before_interact" end
 
-    if context.isCancelled() then return false, "cancelled" end
+    -- Final revalidation
+    valid, reason = revalidateOrb()
+    if not valid then return false, reason end
 
-    -- Get orb position
-    local okPos, orbCFrame = pcall(function() return root.CFrame end)
-    if not okPos or not orbCFrame then
-        return false, "cannot_read_position"
-    end
-
-    -- Get character
-    local character = LocalPlayer.Character
-    if not character then return false, "no_character" end
-    local hrp = character:FindFirstChild("HumanoidRootPart")
-    if not hrp then return false, "no_hrp" end
-
-    -- Teleport to orb position
-    local okTp, tpErr = pcall(function()
-        hrp.CFrame = orbCFrame * CFrame.new(0, 0, 2)
-    end)
-    if not okTp then
-        return false, "teleport_failed: " .. tostring(tpErr)
-    end
-
-    Logger.log("[ACTION] CollectOrb: teleported to orb position", "action")
-
-    -- Wait settle time before firing prompt
-    task.wait(Config.OrbTeleportSettleTime)
-
-    if context.isCancelled() then return false, "cancelled_after_teleport" end
-
-    -- Revalidate everything again after the wait
-    if not isInstanceValid(orbInfo.instance) then
-        return false, "item_removed_during_settle"
-    end
-    if not isInstanceValid(prompt) then
-        return false, "prompt_removed_during_settle"
-    end
+    Logger.log("[ORB] Interaction requested", "orb")
 
     -- Fire ProximityPrompt
+    local prompt = orbInfo.prompt
     local okFire, fireErr = pcall(function()
         fireproximityprompt(prompt)
     end)
 
     if not okFire then
-        -- Fallback: try firing the signal directly
+        -- Fallback: try InputHoldBegin/End
         local okAlt = pcall(function()
             prompt:InputHoldBegin()
             task.wait(prompt.HoldDuration + 0.05)
             prompt:InputHoldEnd()
         end)
         if not okAlt then
-            return false, "fireproximityprompt_failed: " .. tostring(fireErr)
+            Logger.log("[ORB] Interaction dispatch failed, adapter needs injection", "warn")
+            return false, "interact_dispatch_failed: " .. tostring(fireErr)
         end
     end
 
@@ -715,6 +797,39 @@ function Actions.CollectOrb(context)
     -- Actual collection confirmation is handled by the Detection Layer:
     -- ProximityPrompt.Triggered fires for LocalPlayer + item removed.
     return true, "prompt_fired"
+end
+
+--[[
+    ReturnToSafePosition:
+    Moves the character back to State.SafeReturnPosition.
+    Only called after confirmed orb collection when ReturnAfterOrb is ON.
+]]
+function Actions.ReturnToSafePosition(context)
+    if context.isCancelled() then return false, "cancelled" end
+
+    local safeCFrame = State.SafeReturnPosition
+    if not safeCFrame then return false, "no_safe_position" end
+
+    local character = LocalPlayer.Character
+    if not character then return false, "no_character" end
+    local hrp = character:FindFirstChild("HumanoidRootPart")
+    if not hrp then return false, "no_hrp" end
+
+    Logger.log("[POSITION] Returning to safe position...", "action")
+
+    local okTp, tpErr = pcall(function()
+        hrp.CFrame = safeCFrame
+    end)
+
+    if not okTp then
+        Logger.log("[POSITION] Return failed: " .. tostring(tpErr), "warn")
+        return false, "return_failed: " .. tostring(tpErr)
+    end
+
+    task.wait(0.3) -- settle
+
+    Logger.log("[POSITION] Returned to safe position", "action")
+    return true, "returned"
 end
 
 -- ════════════════════════════════════════════════════════════════
@@ -876,6 +991,11 @@ function ActionController.RequestFarmTrial()
         end
     end
 
+    -- Guard against starting loop without container
+    if not trialContainer then
+        return false, "no_trial_container_found"
+    end
+
     State._attemptCounter = State._attemptCounter + 1
     local attemptId = State._attemptCounter
 
@@ -883,12 +1003,17 @@ function ActionController.RequestFarmTrial()
         name       = "FARM_TRIAL",
         startedAt  = tick(),
         attemptId  = attemptId,
-        timeout    = Config.ActionTimeouts.FarmStartup,
+        timeout    = Config.ActionTimeouts.FarmTrial,  -- math.huge: lifecycle worker
         cancelled  = false,
         targetItem = nil,
     }
 
     Logger.log("[ACTION] FARM_TRIAL requested (#" .. attemptId .. ")", "action")
+    if State._pendingRecoveryLog then
+        Logger.log("[TRIAL] Trial worker recovered from existing active Trial", "trial")
+        State._pendingRecoveryLog = false
+    end
+    Logger.log("[ACTION] Trial worker started", "action")
     State.LastAction = "FARM_TRIAL #" .. attemptId
 
     task.spawn(function()
@@ -903,6 +1028,15 @@ function ActionController.RequestFarmTrial()
 
         if not success and State.CurrentAction.attemptId == attemptId and not State.CurrentAction.cancelled then
             Logger.log("[ACTION] FARM_TRIAL adapter returned: " .. (reason or "unknown"), "warn")
+            State._actionCooldowns.FARM_TRIAL = tick() + Config.ActionRetryCooldown
+            StateMachine.clearCurrentAction("adapter_failed")
+            
+            -- Re-evaluate after cooldown to permit safe recovery without aggressive looping
+            task.delay(Config.ActionRetryCooldown + 0.1, function()
+                if not State.HubClosed then
+                    Arbiter.evaluate()
+                end
+            end)
         end
     end)
 
@@ -993,6 +1127,10 @@ function ActionController.CancelCurrent(reason)
     State.CurrentAction.cancelled = true
     Logger.log("[ACTION] " .. actionName .. " cancelled: " .. (reason or "no reason"), "warn")
 
+    if actionName == "FARM_TRIAL" then
+        Logger.log("[ACTION] Trial worker stopped", "warn")
+    end
+
     -- Set cooldown so we don't immediately retry
     State._actionCooldowns[actionName] = tick() + Config.ActionRetryCooldown
 
@@ -1005,6 +1143,10 @@ end
 function ActionController.checkTimeout()
     if State.CurrentAction.name == "NONE" then return end
     if State.CurrentAction.cancelled then return end
+
+    -- FARM_TRIAL is a lifecycle worker — it does not timeout.
+    -- It is cancelled by detection (trial ends, toggle off, hub closed).
+    if State.CurrentAction.name == "FARM_TRIAL" then return end
 
     local elapsed = tick() - State.CurrentAction.startedAt
     if elapsed >= State.CurrentAction.timeout then
@@ -1023,6 +1165,64 @@ function ActionController.checkTimeout()
         -- Re-evaluate
         Arbiter.evaluate()
     end
+end
+
+function ActionController.RequestReturnToSafe()
+    if State.HubClosed then return false, "hub_closed" end
+    if not State.AutomationMaster then return false, "automation_off" end
+    if not State.ReturnAfterOrb then return false, "return_after_orb_off" end
+    if State.CurrentAction.name ~= "NONE" then return false, "action_locked" end
+    if not State.SafeReturnPosition then
+        Logger.log("[POSITION] Return skipped: no fixed position", "info")
+        return false, "no_safe_position"
+    end
+
+    -- Trial has priority
+    if State.trialAvailable or State.trialActive
+        or State.MainState == "TRIAL_AVAILABLE"
+        or State.MainState == "TRIAL_ENTERING"
+        or State.MainState == "TRIAL_ACTIVE" then
+        return false, "trial_has_priority"
+    end
+
+    if tick() < (State._actionCooldowns.RETURN_TO_SAFE or 0) then
+        return false, "cooldown"
+    end
+
+    State._attemptCounter = State._attemptCounter + 1
+    local attemptId = State._attemptCounter
+
+    State.CurrentAction = {
+        name       = "RETURN_TO_SAFE",
+        startedAt  = tick(),
+        attemptId  = attemptId,
+        timeout    = Config.ActionTimeouts.ReturnToSafe,
+        cancelled  = false,
+        targetItem = nil,
+    }
+
+    Logger.log("[ACTION] RETURN_TO_SAFE requested (#" .. attemptId .. ")", "action")
+    State.LastAction = "RETURN_TO_SAFE #" .. attemptId
+
+    task.spawn(function()
+        local success, reason = Actions.ReturnToSafePosition({
+            attemptId   = attemptId,
+            isCancelled = function()
+                return State.CurrentAction.cancelled
+                    or State.CurrentAction.attemptId ~= attemptId
+            end,
+        })
+
+        if success and State.CurrentAction.attemptId == attemptId then
+            Logger.log("[ACTION] RETURN_TO_SAFE completed", "action")
+            StateMachine.clearCurrentAction("return_completed")
+        elseif not success and State.CurrentAction.attemptId == attemptId
+            and not State.CurrentAction.cancelled then
+            Logger.log("[ACTION] RETURN_TO_SAFE failed: " .. (reason or "unknown"), "warn")
+        end
+    end)
+
+    return true
 end
 
 -- ════════════════════════════════════════════════════════════════
@@ -1075,7 +1275,16 @@ function Arbiter.evaluate()
     elseif State.MainState == "TRIAL_ENDING" or State.MainState == "POST_TRIAL" then
         -- Priority 4: Waiting for trial to finish, no new actions
     elseif State.MainState == "IDLE" then
-        -- Priority 5/6: Check orb availability
+        -- Priority 5: Check if return to safe is pending
+        if State.OrbState == "COLLECTED" and State.ReturnAfterOrb
+            and State.SafeReturnPosition then
+            if tick() >= (State._actionCooldowns.RETURN_TO_SAFE or 0) then
+                ActionController.RequestReturnToSafe()
+                return
+            end
+        end
+
+        -- Priority 6: Check orb availability
         if State.OrbState == "AVAILABLE" and State.AutoOrb then
             -- Before requesting, do a final check that no trial appeared
             if not State.trialAvailable and not State.trialActive then
@@ -1327,6 +1536,7 @@ function Detection.updateOrbStateAfterChange()
         if info.removed or info.collected or not isInstanceValid(inst) then
             if not info.removed and not info.collected then
                 info.removed = true
+                info.collected = false
                 Detection.cleanupOrbInfo(info)
             end
         end
@@ -1417,6 +1627,10 @@ function Detection.onInviteEnabledChanged()
 end
 
 --- Handle Gamemode.Enabled changed (PlayerGui.Gamemode).
+--- IMPORTANT: Gamemode.Enabled is NOT sufficient to confirm Time Trial.
+--- It also activates during Raids, Dungeons, and other game modes.
+--- TRIAL_ACTIVE is ONLY confirmed by a real Time Trial container
+--- existing in _ENEMIES.Server.Gamemode.
 function Detection.onGamemodeEnabledChanged()
     if State.HubClosed then return end
     if not State.MonitorTrial then return end
@@ -1428,29 +1642,55 @@ function Detection.onGamemodeEnabledChanged()
     if not ok then return end
 
     if enabled then
-        -- Trial entry confirmation signal
-        if not State._trialEntryProcessed then
-            State._trialEntryProcessed = true
-            State.trialActive = true
-
-            if State.MainState ~= "TRIAL_ACTIVE" then
-                State.TrialsEntered = State.TrialsEntered + 1
-                Logger.log("[TRIAL] Entered Time Trial", "trial")
-                State.LastEvent = "Trial entered"
-                StateMachine.setMainState("TRIAL_ACTIVE")
-
-                -- Confirm current ENTER_TRIAL action if running
-                if State.CurrentAction.name == "ENTER_TRIAL" then
-                    Logger.log("[ACTION] ENTER_TRIAL confirmed", "action")
-                    StateMachine.clearCurrentAction("confirmed_entry")
+        -- Gamemode activated: verify this is actually a Time Trial
+        -- by checking for a real Time Trial container
+        local isTimeTrial = false
+        local gm = resolveEnemiesGamemode()
+        if gm then
+            local okC, children = pcall(function() return gm:GetChildren() end)
+            if okC then
+                for _, child in ipairs(children) do
+                    local cok, cname = pcall(function() return child.Name end)
+                    if cok and cname:lower():find("time trial", 1, true) then
+                        isTimeTrial = true
+                        break
+                    end
                 end
             end
         end
+
+        if isTimeTrial then
+            -- Confirmed Time Trial via real container
+            -- Note: onGamemodeFolderChildAdded may have already handled this,
+            -- but this serves as a secondary confirmation path.
+            if not State._trialEntryProcessed then
+                State._trialEntryProcessed = true
+                State._hadConfirmedTimeTrial = true
+                State.trialActive = true
+
+                if State.MainState ~= "TRIAL_ACTIVE" then
+                    State.TrialsEntered = State.TrialsEntered + 1
+                    Logger.log("[TRIAL] real Time Trial confirmed", "trial")
+                    Logger.log("[TRIAL] Entered Time Trial (confirmed by Gamemode + container)", "trial")
+                    State.LastEvent = "Trial entered"
+                    StateMachine.setMainState("TRIAL_ACTIVE")
+
+                    if State.CurrentAction.name == "ENTER_TRIAL" then
+                        Logger.log("[ACTION] ENTER_TRIAL confirmed", "action")
+                        StateMachine.clearCurrentAction("confirmed_entry")
+                    end
+                end
+            end
+        else
+            -- Non-Trial gamemode (Raid, Dungeon, etc.) — ignore
+            Logger.log("[GAMEMODE] non-trial gamemode ignored", "info")
+        end
     else
-        -- Gamemode disabled: trial ending
-        if State.trialActive and not State._trialEndProcessed then
+        -- Gamemode disabled: only process as trial ending if we
+        -- actually had a confirmed Time Trial running.
+        if State._hadConfirmedTimeTrial and State.trialActive and not State._trialEndProcessed then
             State._trialEndProcessed = true
-            Logger.log("[TRIAL] Time Trial ending", "trial")
+            Logger.log("[TRIAL] Time Trial ending (Gamemode disabled)", "trial")
             State.LastEvent = "Trial ending"
             StateMachine.setMainState("TRIAL_ENDING")
 
@@ -1485,10 +1725,12 @@ function Detection.onGamemodeFolderChildAdded(child)
 
     if not State._trialEntryProcessed then
         State._trialEntryProcessed = true
+        State._hadConfirmedTimeTrial = true
         State.trialActive = true
 
         if State.MainState ~= "TRIAL_ACTIVE" then
             State.TrialsEntered = State.TrialsEntered + 1
+            Logger.log("[TRIAL] real Time Trial confirmed", "trial")
             Logger.log("[TRIAL] Entered Time Trial (" .. name .. ")", "trial")
             State.LastEvent = "Trial entered: " .. name
             StateMachine.setMainState("TRIAL_ACTIVE")
@@ -1531,6 +1773,8 @@ function Detection.handleTrialFinished()
     State.trialModeName = ""
     State._trialEntryProcessed = false
     State._trialEndProcessed = false
+    State._hadConfirmedTimeTrial = false
+    State._pendingRecoveryLog = false
     State.TrialsFinished = State.TrialsFinished + 1
     Logger.log("[TRIAL] Time Trial finished", "trial")
     State.LastEvent = "Trial finished"
@@ -1785,9 +2029,11 @@ function Detection.snapshotTrial()
                         State.trialActive = true
                         State.trialModeName = cname
                         State._trialEntryProcessed = true
+                        State._hadConfirmedTimeTrial = true
 
                         if State.MainState ~= "TRIAL_ACTIVE" then
                             State.TrialsEntered = State.TrialsEntered + 1
+                            Logger.log("[TRIAL] real Time Trial confirmed", "trial")
                             Logger.log("[TRIAL] Time Trial active (snapshot: " .. cname .. ")", "trial")
                             State.LastEvent = "Trial active (snapshot)"
                             StateMachine.setMainState("TRIAL_ACTIVE")
@@ -1806,6 +2052,16 @@ function Detection.snapshotTrial()
         if ok and enabled and State.trialActive then
             -- Additional confirmation already in TRIAL_ACTIVE state
         end
+    end
+end
+
+--- Check if we just turned on automation while already in an active trial
+function Detection.recoverTrialWorkerIfNeeded()
+    if State.HubClosed then return end
+    if State.AutomationMaster and State.AutoTrial and State.trialActive and State.CurrentAction.name ~= "FARM_TRIAL" then
+        State._pendingRecoveryLog = true
+    else
+        State._pendingRecoveryLog = false
     end
 end
 
@@ -1901,11 +2157,15 @@ function Detection.resetState()
     -- Clear transient
     State._trialEntryProcessed = false
     State._trialEndProcessed = false
+    State._hadConfirmedTimeTrial = false
+    State._pendingRecoveryLog = false
     State._actionCooldowns = {
         ENTER_TRIAL = 0,
         FARM_TRIAL = 0,
         COLLECT_ORB = 0,
+        RETURN_TO_SAFE = 0,
     }
+    -- NOTE: SafeReturnPosition is NOT cleared on reset (per spec)
 
     -- Cancel current action
     if State.CurrentAction.name ~= "NONE" then
@@ -1960,7 +2220,7 @@ local COLORS = {
 }
 
 local WINDOW_WIDTH = 310
-local WINDOW_HEIGHT = 470
+local WINDOW_HEIGHT = 540
 local TITLE_HEIGHT = 26
 
 -- GUI element references for updates
@@ -2185,6 +2445,8 @@ function GuiModule.build()
         if on then
             Logger.log("[SYSTEM] Monitor Trial ON — snapshotting", "system")
             Detection.snapshotTrial()
+            Detection.recoverTrialWorkerIfNeeded()
+            Arbiter.evaluate()
         else
             Logger.log("[SYSTEM] Monitor Trial OFF", "system")
         end
@@ -2206,7 +2468,16 @@ function GuiModule.build()
     GuiRefs.TogAutoMaster, GuiRefs.SetAutoMaster = createToggle(togglesPanel, halfW + 10, 18, halfW, "Master", State.AutomationMaster, function(on)
         State.AutomationMaster = on
         Logger.log("[SYSTEM] Automation Master " .. (on and "ON" or "OFF"), "system")
-        if on then Arbiter.evaluate() end
+        if on then 
+            if State.MonitorTrial then Detection.snapshotTrial() end
+            Detection.recoverTrialWorkerIfNeeded()
+            Arbiter.evaluate() 
+        else
+            State._pendingRecoveryLog = false
+            if State.CurrentAction.name == "FARM_TRIAL" then
+                ActionController.CancelCurrent("automation_master_off")
+            end
+        end
     end)
 
     GuiRefs.TogAutoJoin, GuiRefs.SetAutoJoin = createToggle(togglesPanel, halfW + 10, 38, halfW, "Auto Join", State.AutoJoinTrial, function(on)
@@ -2218,7 +2489,16 @@ function GuiModule.build()
     GuiRefs.TogAutoTrial, GuiRefs.SetAutoTrial = createToggle(togglesPanel, halfW + 10, 58, halfW, "Auto Trial", State.AutoTrial, function(on)
         State.AutoTrial = on
         Logger.log("[SYSTEM] Auto Trial " .. (on and "ON" or "OFF"), "system")
-        if on then Arbiter.evaluate() end
+        if on then 
+            if State.MonitorTrial then Detection.snapshotTrial() end
+            Detection.recoverTrialWorkerIfNeeded()
+            Arbiter.evaluate() 
+        else
+            State._pendingRecoveryLog = false
+            if State.CurrentAction.name == "FARM_TRIAL" then
+                ActionController.CancelCurrent("auto_trial_off")
+            end
+        end
     end)
 
     GuiRefs.TogAutoOrb, GuiRefs.SetAutoOrb = createToggle(togglesPanel, halfW + 10, 78, halfW, "Auto Orb", State.AutoOrb, function(on)
@@ -2227,17 +2507,23 @@ function GuiModule.build()
         if on then Arbiter.evaluate() end
     end)
 
-    -- Filler for monitor column alignment: put a divider at row 3
-    local monDiv = Instance.new("TextLabel")
-    monDiv.Size = UDim2.new(0, halfW, 0, 18)
-    monDiv.Position = UDim2.new(0, 4, 0, 58)
-    monDiv.BackgroundTransparency = 1
-    monDiv.Font = Enum.Font.RobotoMono
-    monDiv.TextSize = 9
-    monDiv.TextColor3 = COLORS.textDim
-    monDiv.TextXAlignment = Enum.TextXAlignment.Left
-    monDiv.Text = ""
-    monDiv.Parent = togglesPanel
+    -- Return After Orb toggle (left column row 3)
+    GuiRefs.TogReturnOrb, GuiRefs.SetReturnOrb = createToggle(togglesPanel, 4, 58, halfW, "Ret Orb", State.ReturnAfterOrb, function(on)
+        State.ReturnAfterOrb = on
+        Logger.log("[SYSTEM] Return After Orb " .. (on and "ON" or "OFF"), "system")
+    end)
+
+    -- Fixed Position display (left column row 4)
+    GuiRefs.FixedPosLabel = Instance.new("TextLabel")
+    GuiRefs.FixedPosLabel.Size = UDim2.new(0, halfW, 0, 18)
+    GuiRefs.FixedPosLabel.Position = UDim2.new(0, 4, 0, 78)
+    GuiRefs.FixedPosLabel.BackgroundTransparency = 1
+    GuiRefs.FixedPosLabel.Font = Enum.Font.RobotoMono
+    GuiRefs.FixedPosLabel.TextSize = 9
+    GuiRefs.FixedPosLabel.TextColor3 = COLORS.textDim
+    GuiRefs.FixedPosLabel.TextXAlignment = Enum.TextXAlignment.Left
+    GuiRefs.FixedPosLabel.Text = State.SafeReturnPosition and "FixPos: SET" or "FixPos: NOT SET"
+    GuiRefs.FixedPosLabel.Parent = togglesPanel
 
     -- ─── COUNTERS PANEL ────────────────────────────
     local countersPanel = GuiModule._createPanel(contentFrame, "CountersPanel", 36, 3)
@@ -2384,7 +2670,7 @@ function GuiModule.build()
     _logLayout = logLayout
 
     -- ─── BUTTONS PANEL ─────────────────────────────
-    local buttonsPanel = GuiModule._createPanel(contentFrame, "ButtonsPanel", 28, 6)
+    local buttonsPanel = GuiModule._createPanel(contentFrame, "ButtonsPanel", 56, 6)
     buttonsPanel.BackgroundTransparency = 1
 
     local btnWidth = math.floor((WINDOW_WIDTH - 20) / 2)
@@ -2412,6 +2698,32 @@ function GuiModule.build()
     clearBtn.Text = "Clear Log"
     clearBtn.Parent = buttonsPanel
     Instance.new("UICorner", clearBtn).CornerRadius = UDim.new(0, 4)
+
+    -- Fix Position button
+    local fixPosBtn = Instance.new("TextButton")
+    fixPosBtn.Size = UDim2.new(0, btnWidth, 0, 22)
+    fixPosBtn.Position = UDim2.new(0, 2, 0, 28)
+    fixPosBtn.BackgroundColor3 = COLORS.toggleOn
+    fixPosBtn.BorderSizePixel = 0
+    fixPosBtn.Font = Enum.Font.GothamMedium
+    fixPosBtn.TextSize = 10
+    fixPosBtn.TextColor3 = COLORS.text
+    fixPosBtn.Text = "Fix Position"
+    fixPosBtn.Parent = buttonsPanel
+    Instance.new("UICorner", fixPosBtn).CornerRadius = UDim.new(0, 4)
+
+    -- Clear Fixed Position button
+    local clearPosBtn = Instance.new("TextButton")
+    clearPosBtn.Size = UDim2.new(0, btnWidth, 0, 22)
+    clearPosBtn.Position = UDim2.new(0, btnWidth + 6, 0, 28)
+    clearPosBtn.BackgroundColor3 = COLORS.btnBg
+    clearPosBtn.BorderSizePixel = 0
+    clearPosBtn.Font = Enum.Font.GothamMedium
+    clearPosBtn.TextSize = 10
+    clearPosBtn.TextColor3 = COLORS.text
+    clearPosBtn.Text = "Clear FixPos"
+    clearPosBtn.Parent = buttonsPanel
+    Instance.new("UICorner", clearPosBtn).CornerRadius = UDim.new(0, 4)
 
     -- ─── DRAGGING ──────────────────────────────────
     local dragging = false
@@ -2477,6 +2789,39 @@ function GuiModule.build()
     -- ─── CLEAR LOG ─────────────────────────────────
     clearBtn.MouseButton1Click:Connect(function()
         Logger.clear()
+    end)
+
+    -- ─── FIX POSITION ──────────────────────────────
+    fixPosBtn.MouseButton1Click:Connect(function()
+        local character = LocalPlayer.Character
+        if character then
+            local hrp = character:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                State.SafeReturnPosition = hrp.CFrame
+                local pos = hrp.Position
+                Logger.log(string.format("[POSITION] Safe Position fixed: %.0f, %.0f, %.0f",
+                    pos.X, pos.Y, pos.Z), "action")
+                if GuiRefs.FixedPosLabel then
+                    GuiRefs.FixedPosLabel.Text = string.format("FixPos: %.0f,%.0f,%.0f",
+                        pos.X, pos.Y, pos.Z)
+                    GuiRefs.FixedPosLabel.TextColor3 = COLORS.green
+                end
+            else
+                Logger.log("[POSITION] Cannot fix: no HumanoidRootPart", "warn")
+            end
+        else
+            Logger.log("[POSITION] Cannot fix: no character", "warn")
+        end
+    end)
+
+    -- ─── CLEAR FIXED POSITION ──────────────────────
+    clearPosBtn.MouseButton1Click:Connect(function()
+        State.SafeReturnPosition = nil
+        Logger.log("[POSITION] Safe Position cleared", "action")
+        if GuiRefs.FixedPosLabel then
+            GuiRefs.FixedPosLabel.Text = "FixPos: NOT SET"
+            GuiRefs.FixedPosLabel.TextColor3 = COLORS.textDim
+        end
     end)
 
     -- Parent to PlayerGui
@@ -2791,7 +3136,7 @@ local function initialize()
     end)
 
     Logger.log("[SYSTEM] HUB initialized — Main: " .. State.MainState .. " | Orb: " .. State.OrbState, "system")
-    Logger.log("[SYSTEM] Adapters are LIVE — all systems fully active", "system")
+    Logger.log("[SYSTEM] All systems active — Raid guard ON, lifecycle farm, distance-verified orb", "system")
 end
 
 -- Run initialization
@@ -2802,86 +3147,85 @@ initialize()
 ASSUMPTIONS / UNCONFIRMED
 ════════════════════════════════════════════════════════════════
 
+=== ENVIRONMENT ===
+
 1. getgenv() is assumed available (executor environment).
-   If running in standard Roblox Studio, replace with a shared
-   table or _G approach.
+   If running in standard Roblox Studio, replace with _G or shared.
 
 2. task.spawn, task.delay, task.defer, task.wait are assumed
    available (modern Roblox task library).
 
 3. workspace:GetServerTimeNow() is assumed available.
-   A fallback to tick() is provided if it errors.
+   Fallback to tick() if it errors.
 
-4. The "Time Trial" child in _ENEMIES.Server.Gamemode was observed
-   as "Time Trial_-1". The detection uses case-insensitive
-   string.find("time trial") to be tolerant of variations.
-   It is NOT confirmed whether other naming patterns exist
-   (e.g., "Time Trial_-2" for different difficulties).
+=== GAME STRUCTURE ===
 
-5. ProximityPrompt.Triggered is assumed to fire with the Player
-   who triggered it as the first argument. This is standard
-   Roblox behavior but was confirmed only for the
-   CommandmentFragment case.
+4. The Time Trial child in _ENEMIES.Server.Gamemode was observed
+   as "Time Trial_-1". Detection uses case-insensitive
+   string.find("time trial"). Other naming variants are UNCONFIRMED.
 
-6. It is NOT confirmed whether multiple CommandmentFragments
-   can coexist simultaneously. The system supports it, but
-   this scenario was never observed in testing.
+5. ProximityPrompt.Triggered fires with the Player as first arg.
+   Standard Roblox; confirmed for CommandmentFragment case only.
 
-7. It is NOT confirmed whether _SPAWNITEMS can contain other
-   objects with Type="CommandmentFragment" that are NOT the
-   collectible orb. The secondary check SpawnId="Commandments"
-   provides extra filtering.
+6. Multiple CommandmentFragments coexisting: supported but
+   never observed in testing.
 
-8. It is NOT confirmed whether Invite can activate for reasons
-   OTHER than Time Trial (e.g., other game modes). The text
-   check for "time trial" mitigates false positives.
+7. _SPAWNITEMS may contain non-orb objects with
+   Type="CommandmentFragment": UNCONFIRMED. SpawnId check exists.
 
-9. ScrollingFrame.AutomaticCanvasSize is assumed supported.
-   If not available in the executor's Roblox version, manual
-   canvas size calculation would be needed.
+8. Invite can activate for non-Trial reasons: mitigated by
+   text check for "time trial".
 
-10. Instance.Destroying event is assumed available (modern Roblox).
-    AncestryChanged is used as a fallback/complement.
+9. Gamemode.Enabled activates for Raids, Dungeons, and other
+   modes besides Time Trial. The system now guards against this
+   by requiring a real Time Trial container in _ENEMIES.Server.Gamemode.
 
-11. The timer display fallback (reading Gui.Label.Text for
-    "Despawns in MM:SS") assumes the GUI structure
-    item > Gui > Label remains consistent. Only the
-    ExpireAt attribute was directly confirmed; the GUI text
-    was observed but could change.
+10. ScrollingFrame.AutomaticCanvasSize is assumed supported.
 
-12. Character respawn handling assumes HumanoidRootPart exists
-    within the Character model. While mobs may not follow this
-    convention, the LocalPlayer's character is assumed standard.
+11. Instance.Destroying event is assumed available.
+    AncestryChanged is fallback.
 
-=== ADAPTER-SPECIFIC ASSUMPTIONS ===
+12. Timer display fallback reads item > Gui > Label for
+    "Despawns in MM:SS". GUI structure is UNCONFIRMED stable.
 
-13. firesignal() is assumed available in the executor.
-    Used by EnterTrial to dispatch MouseButton1Click on the
-    Invite confirmation button.
+13. Character.HumanoidRootPart exists for LocalPlayer.
+    Mobs may NOT follow this convention.
 
-14. fireproximityprompt() is assumed available in the executor.
-    Used by CollectOrb to trigger the ProximityPrompt.
-    Fallback: InputHoldBegin/InputHoldEnd on the prompt.
+=== ADAPTER-SPECIFIC ===
 
-15. EnterTrial scans Invite descendants for a TextButton with
-    keywords ("join", "yes", "enter", "accept", "confirm", "ok").
-    If no keyword match, the first visible TextButton is used.
-    The exact button name/text was not confirmed beyond the
-    observed "The Hallway Easy is open, join now?" scenario.
+14. firesignal() / fireproximityprompt() assumed available
+    in the executor. Both adapters have fallback paths.
+    In Roblox Studio, these adapters need mock/injection.
 
-16. FarmTrial does NOT assume Humanoid on enemies.
-    It checks HumanoidRootPart > PrimaryPart > first BasePart.
-    Enemy models inside the trial container are assumed to be
-    direct children. If enemies are nested deeper, the search
-    would need adjustment.
+15. EnterTrial now searches for ANY GuiButton (TextButton +
+    ImageButton). TextButton matched by keywords; ImageButton
+    matched by green-ish BackgroundColor3 (G > 0.4, G > R*1.3)
+    or Image asset name containing check/accept/confirm/yes.
+    Fallback: first visible GuiButton. The exact UI layout
+    (green check ImageButton, red X ImageButton) was observed
+    but is UNCONFIRMED stable across all Invite variations.
 
-17. FarmTrial teleports the player TO the enemy with a 3-stud
-    Z offset. It does NOT perform any attack action — the
-    assumption is that proximity-based auto-attack or another
-    system handles damage. If explicit attack logic is needed,
-    this adapter would require extension.
+16. FarmTrial is a lifecycle worker (timeout = math.huge).
+    It does NOT timeout. Terminated only by:
+    - Trial container destroyed
+    - cancel token (trial ends, toggle off, hub closed)
+    Enemy models are assumed direct children of the container.
 
-18. CollectOrb teleports the player to the orb Root with a
-    2-stud Z offset, waits 0.25s for settle, then fires the
-    prompt. The settle time is configurable (Config.OrbTeleportSettleTime).
+17. FarmTrial teleports player to enemy (3-stud Z offset).
+    No explicit attack — assumes proximity auto-attack.
+
+18. CollectOrb verifies TARGET_REACHED after move by measuring
+    distance (HRP to Root). Threshold: Config.OrbReachDistance
+    (default 16 studs). Retries up to Config.OrbMoveMaxRetries
+    (default 3). Interaction fires ONLY after TARGET_REACHED.
+
+19. The CAUSE of long-distance move failure is UNCONFIRMED.
+    Possible factors: streaming, region not loaded, server
+    correction. The system measures and retries defensively
+    without assuming the cause.
+
+20. ReturnToSafePosition teleports to State.SafeReturnPosition.
+    Only after confirmed COLLECTED + ReturnAfterOrb ON.
+    SafeReturnPosition is set MANUALLY via Fix Position button.
+    Never auto-saved.
 ]]

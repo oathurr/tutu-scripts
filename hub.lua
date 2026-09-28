@@ -105,6 +105,7 @@ local State = {
 
     -- Safe Return Position (manual only)
     SafeReturnPosition = nil, -- CFrame or nil
+    OrbRecoveryPosition = nil, -- CFrame or nil
 
     -- Detection cache
     trialAvailable = false,
@@ -140,6 +141,8 @@ local State = {
         FARM_TRIAL           = 0,
         COLLECT_ORB          = 0,
         RETURN_TO_SAFE       = 0,
+        ORB_RECOVERY_STAGE   = 0,
+        FAILSAFE_RETURN      = 0,
     },
     _pendingTasks = {},  -- tracked task.delay handles for cancellation
 }
@@ -801,13 +804,14 @@ end
 
 --[[
     ReturnToSafePosition:
-    Moves the character back to State.SafeReturnPosition.
-    Only called after confirmed orb collection when ReturnAfterOrb is ON.
+    Moves the character back to a safe location.
+    If context.targetCFrame is provided, it uses that (for standalone staging).
+    Otherwise, it defaults purely to State.SafeReturnPosition.
 ]]
 function Actions.ReturnToSafePosition(context)
     if context.isCancelled() then return false, "cancelled" end
 
-    local safeCFrame = State.SafeReturnPosition
+    local safeCFrame = context.targetCFrame or State.SafeReturnPosition
     if not safeCFrame then return false, "no_safe_position" end
 
     local character = LocalPlayer.Character
@@ -815,20 +819,20 @@ function Actions.ReturnToSafePosition(context)
     local hrp = character:FindFirstChild("HumanoidRootPart")
     if not hrp then return false, "no_hrp" end
 
-    Logger.log("[POSITION] Returning to safe position...", "action")
+    Logger.log("[POSITION] Moving to target location...", "action")
 
     local okTp, tpErr = pcall(function()
         hrp.CFrame = safeCFrame
     end)
 
     if not okTp then
-        Logger.log("[POSITION] Return failed: " .. tostring(tpErr), "warn")
+        Logger.log("[POSITION] Return move failed: " .. tostring(tpErr), "warn")
         return false, "return_failed: " .. tostring(tpErr)
     end
 
     task.wait(0.3) -- settle
 
-    Logger.log("[POSITION] Returned to safe position", "action")
+    Logger.log("[POSITION] Arrived at target location", "action")
     return true, "returned"
 end
 
@@ -1114,9 +1118,113 @@ function ActionController.RequestCollectOrb(orbInfo)
 
         if not success and State.CurrentAction.attemptId == attemptId and not State.CurrentAction.cancelled then
             Logger.log("[ACTION] COLLECT_ORB adapter returned: " .. (reason or "unknown"), "warn")
+
+            -- ORB RECOVERY LOGIC (Target Not Reached)
+            if reason == "target_not_reached" then
+                -- Revalidate the exact same orb specifically before triggering recovery
+                local isValid = isInstanceValid(orbInfo.instance) 
+                            and safeGetAttribute(orbInfo.instance, "Type") == "CommandmentFragment"
+                            and isInstanceValid(orbInfo.root)
+                            and isInstanceValid(orbInfo.prompt)
+                            and (not orbInfo.expireAt or (orbInfo.expireAt - getServerTime() > 0))
+                
+                if isValid then
+                    if not orbInfo.recoveryAttempted then
+                        orbInfo.recoveryAttempted = true
+                        Logger.log("[ORB] Target not reached. Initiating single recovery phase.", "warn")
+                        StateMachine.clearCurrentAction("recovery_initiated")
+                        if State.OrbRecoveryPosition then
+                            StateMachine.setOrbState("RECOVERY_PENDING")
+                        else
+                            StateMachine.setOrbState("RECOVERY_READY")
+                        end
+                        return
+                    else
+                        orbInfo.blocked = true
+                        Logger.log("[ORB] Recovery failed. Orb blocked from future retries.", "error")
+                        State.LastError = "Orb recovery failed"
+                        StateMachine.clearCurrentAction("recovery_failed")
+                        
+                        Detection.updateOrbStateAfterChange()
+                        if State.SafeReturnPosition then
+                            ActionController.RequestFailsafeReturn()
+                        end
+                        return
+                    end
+                else
+                    Logger.log("[ORB] Orb invalidated during failure, skipping recovery.", "warn")
+                end
+            end
+
+            State._actionCooldowns.COLLECT_ORB = tick() + Config.ActionRetryCooldown
+            StateMachine.clearCurrentAction("adapter_failed")
         end
     end)
 
+    return true
+end
+
+function ActionController.RequestOrbRecoveryStage(orbInfo)
+    if State.HubClosed then return false, "hub_closed" end
+    if not State.AutomationMaster then return false, "automation_off" end
+    if not State.AutoOrb then return false, "auto_orb_off" end
+    if State.CurrentAction.name ~= "NONE" then return false, "action_locked" end
+
+    -- Recovery staging ONLY if explicit position exists
+    if not State.OrbRecoveryPosition then
+        return false, "no_staging_position"
+    end
+
+    -- Final validation before staging
+    if not orbInfo or not isInstanceValid(orbInfo.instance) or safeGetAttribute(orbInfo.instance, "Type") ~= "CommandmentFragment" or not isInstanceValid(orbInfo.root) then
+        return false, "orb_invalid"
+    end
+    if orbInfo.expireAt and (orbInfo.expireAt - getServerTime()) <= 0 then
+        return false, "orb_expired"
+    end
+
+    State._attemptCounter = State._attemptCounter + 1
+    local attemptId = State._attemptCounter
+
+    State.CurrentAction = {
+        name       = "ORB_RECOVERY_STAGE",
+        startedAt  = tick(),
+        attemptId  = attemptId,
+        timeout    = Config.ActionTimeouts.ReturnToSafe, -- Reuse safe teleport timeout limit
+        cancelled  = false,
+        targetItem = orbInfo,
+    }
+
+    StateMachine.setOrbState("RECOVERY_STAGING")
+    Logger.log("[ACTION] ORB_RECOVERY_STAGE requested (#" .. attemptId .. ")", "action")
+
+    task.spawn(function()
+        -- Staging move intrinsically leverages the user's explicit setup via native adapter wrapper.
+        local success, reason = Actions.ReturnToSafePosition({
+            attemptId   = attemptId,
+            isCancelled = function()
+                return State.CurrentAction.cancelled
+                    or State.CurrentAction.attemptId ~= attemptId
+            end,
+            targetCFrame = State.OrbRecoveryPosition
+        })
+
+        if success and State.CurrentAction.attemptId == attemptId and not State.CurrentAction.cancelled then
+            Logger.log("[ACTION] ORB_RECOVERY_STAGE completed", "action")
+            StateMachine.clearCurrentAction("staging_completed")
+            StateMachine.setOrbState("RECOVERY_READY")
+        elseif not success and State.CurrentAction.attemptId == attemptId and not State.CurrentAction.cancelled then
+            Logger.log("[ACTION] ORB_RECOVERY_STAGE failed: " .. (reason or "unknown"), "warn")
+            orbInfo.blocked = true
+            State._actionCooldowns.ORB_RECOVERY_STAGE = tick() + Config.ActionRetryCooldown
+            StateMachine.clearCurrentAction("staging_failed")
+            
+            Detection.updateOrbStateAfterChange()
+            if State.SafeReturnPosition then
+                ActionController.RequestFailsafeReturn()
+            end
+        end
+    end)
     return true
 end
 
@@ -1151,6 +1259,44 @@ function ActionController.checkTimeout()
     local elapsed = tick() - State.CurrentAction.startedAt
     if elapsed >= State.CurrentAction.timeout then
         local actionName = State.CurrentAction.name
+        
+        -- ORB RECOVERY TIMEOUT CHECK
+        if actionName == "COLLECT_ORB" then
+            local orbInfo = State.CurrentAction.targetItem
+            if orbInfo then
+                local isValid = isInstanceValid(orbInfo.instance) 
+                            and safeGetAttribute(orbInfo.instance, "Type") == "CommandmentFragment"
+                            and isInstanceValid(orbInfo.root)
+                            and isInstanceValid(orbInfo.prompt)
+                            and (not orbInfo.expireAt or (orbInfo.expireAt - getServerTime() > 0))
+
+                if isValid then
+                    if not orbInfo.recoveryAttempted then
+                        orbInfo.recoveryAttempted = true
+                        Logger.log("[ORB] Interaction timeout. Initiating single recovery phase.", "warn")
+                        StateMachine.clearCurrentAction("timeout_recovery_initiated")
+                        if State.OrbRecoveryPosition then
+                            StateMachine.setOrbState("RECOVERY_PENDING")
+                        else
+                            StateMachine.setOrbState("RECOVERY_READY")
+                        end
+                        return
+                    else
+                        orbInfo.blocked = true
+                        Logger.log("[ORB] Recovery failed after timeout. Orb blocked.", "error")
+                        State.LastError = "Orb recovery timeout"
+                        StateMachine.clearCurrentAction("recovery_failed")
+                        
+                        Detection.updateOrbStateAfterChange()
+                        if State.SafeReturnPosition then
+                            ActionController.RequestFailsafeReturn()
+                        end
+                        return
+                    end
+                end
+            end
+        end
+
         Logger.log("[ACTION FAILED] " .. actionName .. " timeout", "error")
         State.LastError = actionName .. " timeout"
 
@@ -1225,24 +1371,80 @@ function ActionController.RequestReturnToSafe()
     return true
 end
 
+function ActionController.RequestFailsafeReturn()
+    if State.HubClosed then return false, "hub_closed" end
+    if not State.AutomationMaster then return false, "automation_off" end
+    if State.CurrentAction.name ~= "NONE" then return false, "action_locked" end
+    if not State.SafeReturnPosition then return false, "no_safe_position" end
+
+    -- Trial has priority
+    if State.trialAvailable or State.trialActive
+        or State.MainState == "TRIAL_AVAILABLE"
+        or State.MainState == "TRIAL_ENTERING"
+        or State.MainState == "TRIAL_ACTIVE" then
+        return false, "trial_has_priority"
+    end
+
+    if tick() < (State._actionCooldowns.FAILSAFE_RETURN or 0) then
+        return false, "cooldown"
+    end
+
+    State._attemptCounter = State._attemptCounter + 1
+    local attemptId = State._attemptCounter
+
+    State.CurrentAction = {
+        name       = "FAILSAFE_RETURN",
+        startedAt  = tick(),
+        attemptId  = attemptId,
+        timeout    = Config.ActionTimeouts.ReturnToSafe,
+        cancelled  = false,
+        targetItem = nil,
+    }
+
+    Logger.log("[ACTION] FAILSAFE_RETURN requested (#" .. attemptId .. ")", "action")
+    State.LastAction = "FAILSAFE_RETURN #" .. attemptId
+
+    task.spawn(function()
+        local success, reason = Actions.ReturnToSafePosition({
+            attemptId   = attemptId,
+            isCancelled = function()
+                return State.CurrentAction.cancelled
+                    or State.CurrentAction.attemptId ~= attemptId
+            end,
+        })
+
+        if success and State.CurrentAction.attemptId == attemptId then
+            Logger.log("[ACTION] FAILSAFE_RETURN completed", "action")
+            StateMachine.clearCurrentAction("failsafe_completed")
+        elseif not success and State.CurrentAction.attemptId == attemptId
+            and not State.CurrentAction.cancelled then
+            Logger.log("[ACTION] FAILSAFE_RETURN failed: " .. (reason or "unknown"), "warn")
+            State._actionCooldowns.FAILSAFE_RETURN = tick() + Config.ActionRetryCooldown
+            StateMachine.clearCurrentAction("failsafe_failed")
+        end
+    end)
+
+    return true
+end
+
 -- ════════════════════════════════════════════════════════════════
 -- SECTION 11: ARBITER / DECISION CONTROLLER
 -- ════════════════════════════════════════════════════════════════
 -- The Arbiter decides which action (if any) should be requested,
 -- based on current state and priority.
 -- Priority: TRIAL_ACTIVE > TRIAL_AVAILABLE > TRIAL_ENTERING >
---           TRIAL_ENDING/POST_TRIAL > ORB_AVAILABLE > IDLE
+--           TRIAL_ENDING/POST_TRIAL > ORB_RECOVERY_STAGE > ORB_AVAILABLE > IDLE
 
 function Arbiter.evaluate()
     if State.HubClosed then return end
 
     -- Check for preemption: if an Orb action is pending and Trial appeared
-    if State.CurrentAction.name == "COLLECT_ORB" then
+    if State.CurrentAction.name == "COLLECT_ORB" or State.CurrentAction.name == "ORB_RECOVERY_STAGE" or State.CurrentAction.name == "FAILSAFE_RETURN" then
         if State.trialAvailable or State.trialActive
             or State.MainState == "TRIAL_AVAILABLE"
             or State.MainState == "TRIAL_ENTERING"
             or State.MainState == "TRIAL_ACTIVE" then
-            Logger.log("[DECISION] Trial preempted pending Orb action", "decision")
+            Logger.log("[DECISION] Trial preempted pending action", "decision")
             ActionController.CancelCurrent("trial_preemption")
             return -- will be re-evaluated after cancel
         end
@@ -1284,7 +1486,47 @@ function Arbiter.evaluate()
             end
         end
 
-        -- Priority 6: Check orb availability
+        -- Priority 5.5: Orb recovery stage
+        if State.OrbState == "RECOVERY_PENDING" and State.AutoOrb then
+            if not State.trialAvailable and not State.trialActive then
+                local activeOrb = Detection.getActiveOrb()
+                if activeOrb and activeOrb.recoveryAttempted and not activeOrb.blocked then
+                    if State.OrbRecoveryPosition then
+                        if tick() >= (State._actionCooldowns.ORB_RECOVERY_STAGE or 0) then
+                            ActionController.RequestOrbRecoveryStage(activeOrb)
+                            return
+                        end
+                    else
+                        StateMachine.setOrbState("RECOVERY_READY")
+                        return
+                    end
+                else
+                    Detection.updateOrbStateAfterChange()
+                end
+            else
+                Logger.log("[DECISION] Trial has priority over Orb Recovery", "decision")
+            end
+        end
+
+        -- Priority 5.6: Orb recovery ready (collect phase 2)
+        if State.OrbState == "RECOVERY_READY" and State.AutoOrb then
+            if not State.trialAvailable and not State.trialActive then
+                local activeOrb = Detection.getActiveOrb()
+                if activeOrb and activeOrb.recoveryAttempted and not activeOrb.blocked then
+                    if tick() >= (State._actionCooldowns.COLLECT_ORB or 0) then
+                        Logger.log("[DECISION] Requesting Orb collection (Recovery Phase)", "decision")
+                        ActionController.RequestCollectOrb(activeOrb)
+                        return
+                    end
+                else
+                    Detection.updateOrbStateAfterChange()
+                end
+            else
+                Logger.log("[DECISION] Trial has priority over Orb Recovery", "decision")
+            end
+        end
+
+        -- Priority 6: Check normal orb availability
         if State.OrbState == "AVAILABLE" and State.AutoOrb then
             -- Before requesting, do a final check that no trial appeared
             if not State.trialAvailable and not State.trialActive then
@@ -1313,7 +1555,8 @@ function Detection.getActiveOrb()
     local bestExpire = math.huge
 
     for inst, info in pairs(State.ObservedSpawnItems) do
-        if not info.removed and not info.collected and isInstanceValid(inst) then
+        -- Blocked Orbs are ignored entirely to prevent infinite recovery loops
+        if not info.removed and not info.collected and not info.blocked and isInstanceValid(inst) then
             if info.expireAt and info.expireAt > 0 then
                 local remaining = info.expireAt - getServerTime()
                 if remaining > 0 and info.expireAt < bestExpire then
@@ -1336,7 +1579,7 @@ end
 function Detection.getActiveOrbCount()
     local count = 0
     for inst, info in pairs(State.ObservedSpawnItems) do
-        if not info.removed and not info.collected and isInstanceValid(inst) then
+        if not info.removed and not info.collected and not info.blocked and isInstanceValid(inst) then
             count = count + 1
         end
     end
@@ -1393,6 +1636,8 @@ function Detection.inspectSpawnItem(item)
         promptTriggeredAt = nil,
         removed          = false,
         collected        = false,
+        blocked          = false,
+        recoveryAttempted= false,
         position         = position,
         connections      = {},
     }
@@ -1549,12 +1794,20 @@ function Detection.updateOrbStateAfterChange()
         if State.MainState == "TRIAL_AVAILABLE"
             or State.MainState == "TRIAL_ENTERING"
             or State.MainState == "TRIAL_ACTIVE" then
-            if State.OrbState ~= "PENDING" and State.OrbState ~= "COLLECT_ATTEMPT" then
+            if State.OrbState ~= "PENDING" and State.OrbState ~= "COLLECT_ATTEMPT" and State.OrbState ~= "RECOVERY_STAGING" then
                 StateMachine.setOrbState("PENDING")
             end
         else
-            if State.OrbState ~= "AVAILABLE" and State.OrbState ~= "COLLECT_ATTEMPT" then
-                StateMachine.setOrbState("AVAILABLE")
+            -- Restore active recovery states dynamically if applicable
+            local targetState = "AVAILABLE"
+            if activeOrb.recoveryAttempted and not activeOrb.blocked then
+                if State.OrbState == "RECOVERY_STAGING" then targetState = "RECOVERY_STAGING"
+                elseif State.OrbState == "RECOVERY_READY" then targetState = "RECOVERY_READY"
+                else targetState = "RECOVERY_PENDING" end
+            end
+
+            if State.OrbState ~= targetState and State.OrbState ~= "COLLECT_ATTEMPT" then
+                StateMachine.setOrbState(targetState)
             end
         end
     else
@@ -2164,8 +2417,10 @@ function Detection.resetState()
         FARM_TRIAL = 0,
         COLLECT_ORB = 0,
         RETURN_TO_SAFE = 0,
+        ORB_RECOVERY_STAGE = 0,
+        FAILSAFE_RETURN = 0,
     }
-    -- NOTE: SafeReturnPosition is NOT cleared on reset (per spec)
+    -- NOTE: SafeReturnPosition and OrbRecoveryPosition are NOT cleared on reset (per spec)
 
     -- Cancel current action
     if State.CurrentAction.name ~= "NONE" then
@@ -2220,7 +2475,7 @@ local COLORS = {
 }
 
 local WINDOW_WIDTH = 310
-local WINDOW_HEIGHT = 540
+local WINDOW_HEIGHT = 590
 local TITLE_HEIGHT = 26
 
 -- GUI element references for updates
@@ -2385,7 +2640,7 @@ function GuiModule.build()
     GuiRefs.OrbPosVal, GuiRefs.OrbIdVal = createStatusRow(statusPanel, 50, "OrbPos:", "OrbID:")
 
     -- ─── TOGGLES PANEL ─────────────────────────────
-    local togglesPanel = GuiModule._createPanel(contentFrame, "TogglesPanel", 106, 2)
+    local togglesPanel = GuiModule._createPanel(contentFrame, "TogglesPanel", 126, 2)
 
     -- Header row
     local monHeader = Instance.new("TextLabel")
@@ -2524,6 +2779,18 @@ function GuiModule.build()
     GuiRefs.FixedPosLabel.TextXAlignment = Enum.TextXAlignment.Left
     GuiRefs.FixedPosLabel.Text = State.SafeReturnPosition and "FixPos: SET" or "FixPos: NOT SET"
     GuiRefs.FixedPosLabel.Parent = togglesPanel
+
+    -- Orb Recovery Position display (left column row 5)
+    GuiRefs.OrbRecLabel = Instance.new("TextLabel")
+    GuiRefs.OrbRecLabel.Size = UDim2.new(0, halfW, 0, 18)
+    GuiRefs.OrbRecLabel.Position = UDim2.new(0, 4, 0, 98)
+    GuiRefs.OrbRecLabel.BackgroundTransparency = 1
+    GuiRefs.OrbRecLabel.Font = Enum.Font.RobotoMono
+    GuiRefs.OrbRecLabel.TextSize = 9
+    GuiRefs.OrbRecLabel.TextColor3 = COLORS.textDim
+    GuiRefs.OrbRecLabel.TextXAlignment = Enum.TextXAlignment.Left
+    GuiRefs.OrbRecLabel.Text = State.OrbRecoveryPosition and "OrbRec: SET" or "OrbRec: NOT SET"
+    GuiRefs.OrbRecLabel.Parent = togglesPanel
 
     -- ─── COUNTERS PANEL ────────────────────────────
     local countersPanel = GuiModule._createPanel(contentFrame, "CountersPanel", 36, 3)
@@ -2670,7 +2937,7 @@ function GuiModule.build()
     _logLayout = logLayout
 
     -- ─── BUTTONS PANEL ─────────────────────────────
-    local buttonsPanel = GuiModule._createPanel(contentFrame, "ButtonsPanel", 56, 6)
+    local buttonsPanel = GuiModule._createPanel(contentFrame, "ButtonsPanel", 82, 6)
     buttonsPanel.BackgroundTransparency = 1
 
     local btnWidth = math.floor((WINDOW_WIDTH - 20) / 2)
@@ -2724,6 +2991,32 @@ function GuiModule.build()
     clearPosBtn.Text = "Clear FixPos"
     clearPosBtn.Parent = buttonsPanel
     Instance.new("UICorner", clearPosBtn).CornerRadius = UDim.new(0, 4)
+
+    -- Fix OrbRec button
+    local fixOrbRecBtn = Instance.new("TextButton")
+    fixOrbRecBtn.Size = UDim2.new(0, btnWidth, 0, 22)
+    fixOrbRecBtn.Position = UDim2.new(0, 2, 0, 53)
+    fixOrbRecBtn.BackgroundColor3 = COLORS.toggleOn
+    fixOrbRecBtn.BorderSizePixel = 0
+    fixOrbRecBtn.Font = Enum.Font.GothamMedium
+    fixOrbRecBtn.TextSize = 10
+    fixOrbRecBtn.TextColor3 = COLORS.text
+    fixOrbRecBtn.Text = "Fix OrbRec"
+    fixOrbRecBtn.Parent = buttonsPanel
+    Instance.new("UICorner", fixOrbRecBtn).CornerRadius = UDim.new(0, 4)
+
+    -- Clear OrbRec button
+    local clearOrbRecBtn = Instance.new("TextButton")
+    clearOrbRecBtn.Size = UDim2.new(0, btnWidth, 0, 22)
+    clearOrbRecBtn.Position = UDim2.new(0, btnWidth + 6, 0, 53)
+    clearOrbRecBtn.BackgroundColor3 = COLORS.btnBg
+    clearOrbRecBtn.BorderSizePixel = 0
+    clearOrbRecBtn.Font = Enum.Font.GothamMedium
+    clearOrbRecBtn.TextSize = 10
+    clearOrbRecBtn.TextColor3 = COLORS.text
+    clearOrbRecBtn.Text = "Clear OrbRec"
+    clearOrbRecBtn.Parent = buttonsPanel
+    Instance.new("UICorner", clearOrbRecBtn).CornerRadius = UDim.new(0, 4)
 
     -- ─── DRAGGING ──────────────────────────────────
     local dragging = false
@@ -2824,6 +3117,39 @@ function GuiModule.build()
         end
     end)
 
+    -- ─── FIX ORBREC ──────────────────────────────
+    fixOrbRecBtn.MouseButton1Click:Connect(function()
+        local character = LocalPlayer.Character
+        if character then
+            local hrp = character:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                State.OrbRecoveryPosition = hrp.CFrame
+                local pos = hrp.Position
+                Logger.log(string.format("[POSITION] Orb Recovery Position fixed: %.0f, %.0f, %.0f",
+                    pos.X, pos.Y, pos.Z), "action")
+                if GuiRefs.OrbRecLabel then
+                    GuiRefs.OrbRecLabel.Text = string.format("OrbRec: %.0f,%.0f,%.0f",
+                        pos.X, pos.Y, pos.Z)
+                    GuiRefs.OrbRecLabel.TextColor3 = COLORS.green
+                end
+            else
+                Logger.log("[POSITION] Cannot fix OrbRec: no HumanoidRootPart", "warn")
+            end
+        else
+            Logger.log("[POSITION] Cannot fix OrbRec: no character", "warn")
+        end
+    end)
+
+    -- ─── CLEAR ORBREC ──────────────────────
+    clearOrbRecBtn.MouseButton1Click:Connect(function()
+        State.OrbRecoveryPosition = nil
+        Logger.log("[POSITION] Orb Recovery Position cleared", "action")
+        if GuiRefs.OrbRecLabel then
+            GuiRefs.OrbRecLabel.Text = "OrbRec: NOT SET"
+            GuiRefs.OrbRecLabel.TextColor3 = COLORS.textDim
+        end
+    end)
+
     -- Parent to PlayerGui
     local pg = resolvePlayerGui()
     if pg then
@@ -2896,6 +3222,9 @@ function GuiModule.updateLoop()
             or (State.OrbState == "COLLECTED" and COLORS.green)
             or (State.OrbState == "PENDING" and COLORS.blue)
             or (State.OrbState == "COLLECT_ATTEMPT" and COLORS.gold)
+            or (State.OrbState == "RECOVERY_PENDING" and COLORS.gold)
+            or (State.OrbState == "RECOVERY_STAGING" and COLORS.blue)
+            or (State.OrbState == "RECOVERY_READY" and COLORS.gold)
             or COLORS.textDim
     end
 

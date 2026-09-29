@@ -58,21 +58,23 @@ local Config = {
         CollectOrb       = 15,         -- 15s total for move + interact + confirm
         ReturnToSafe     = 10,         -- 10s to return to safe position
     },
-    CollectConfirmWindow   = 5,    -- seconds to correlate Triggered + Removed
-    PostTrialDebounce      = 3,    -- seconds before revalidation after trial end
-    TrialEntryTimeout      = 15,   -- seconds to wait for entry confirmation
-    TrialEndTimeout        = 8,    -- seconds to wait for child removal after Gamemode off
-    ActionRetryCooldown    = 8,    -- seconds before retrying a failed action
-    MaxLogLines            = 150,
-    GuiUpdateInterval      = 1,    -- seconds between GUI refreshes
-    ContainerResolveRetry  = 5,    -- seconds between retries for missing containers
-    OrbExpireThreshold     = 2,    -- seconds: if remaining <= this at removal, likely expired
-    FarmLoopInterval       = 0.1,  -- seconds between farm loop iterations
-    OrbTeleportSettleTime  = 0.25, -- seconds to wait after teleport before firing prompt
-    OrbReachDistance       = 16,   -- studs: max distance to consider TARGET_REACHED
-    OrbMoveMaxRetries      = 3,    -- max move attempts before giving up
-    OrbMoveRetryWait       = 0.5,  -- seconds between retry attempts
-    AntiAfkInterval        = 600,  -- seconds: 10 minutes without input triggers keep-alive
+    CollectConfirmWindow      = 5,    -- seconds to correlate Triggered + Removed
+    PostTrialDebounce         = 3,    -- seconds before revalidation after trial end
+    TrialEntryTimeout         = 15,   -- seconds to wait for entry confirmation
+    TrialEndTimeout           = 8,    -- seconds to wait for child removal after Gamemode off
+    ActionRetryCooldown       = 8,    -- seconds before retrying a failed action
+    MaxLogLines               = 150,
+    GuiUpdateInterval         = 1,    -- seconds between GUI refreshes
+    ContainerResolveRetry     = 5,    -- seconds between retries for missing containers
+    OrbExpireThreshold        = 2,    -- seconds: if remaining <= this at removal, likely expired
+    FarmLoopInterval          = 0.1,  -- seconds between farm loop iterations
+    OrbTeleportSettleTime     = 0.25, -- seconds to wait after teleport before firing prompt
+    OrbReachDistance          = 16,   -- studs: max distance to consider TARGET_REACHED
+    OrbMoveMaxRetries         = 3,    -- max move attempts before giving up
+    OrbMoveRetryWait          = 0.5,  -- seconds between retry attempts
+    AntiAfkInterval           = 600,  -- seconds: 10 minutes without input triggers keep-alive
+    PostTrialOrbObserveWindow = 20,   -- seconds: window to wait for distant orb to replicate post-trial
+    PostTrialOrbPollInterval  = 1,    -- seconds: interval to poll during post-trial observe window
 }
 
 -- ════════════════════════════════════════════════════════════════
@@ -2261,12 +2263,48 @@ function Detection.handleTrialFinished()
 
         -- Revalidate orbs
         if State.MonitorOrb then
-            Detection.snapshotOrbs()
-            local activeOrb = Detection.getActiveOrb()
-            if activeOrb then
-                StateMachine.setOrbState("AVAILABLE")
-                Logger.log("[ORB] Commandment Fragment still available after Trial", "orb")
-            else
+            Logger.log("[ORB OBSERVE] started", "info")
+            local orbFound = false
+            local elapsed = 0
+            local pollInterval = Config.PostTrialOrbPollInterval
+            local maxWait = Config.PostTrialOrbObserveWindow
+
+            while elapsed <= maxWait do
+                if State.HubClosed or not State.MonitorOrb then break end
+                
+                if State.trialAvailable or State.trialActive or State.MainState == "TRIAL_AVAILABLE" or State.MainState == "TRIAL_ENTERING" or State.MainState == "TRIAL_ACTIVE" then
+                    break
+                end
+
+                Detection.snapshotOrbs()
+                local activeOrb = Detection.getActiveOrb()
+                
+                if activeOrb then
+                    orbFound = true
+                    Logger.log("[ORB OBSERVE] fragment became client-visible after " .. elapsed .. "s", "info")
+                    StateMachine.setOrbState("AVAILABLE")
+                    Logger.log("[ORB OBSERVE] ended: orb_found", "info")
+                    break
+                else
+                    local si = Refs.SpawnItems
+                    local childrenCount = si and #si:GetChildren() or 0
+                    local fragCount = 0
+                    if si then
+                        for _, c in ipairs(si:GetChildren()) do
+                            if safeGetAttribute(c, "Type") == "CommandmentFragment" then
+                                fragCount = fragCount + 1
+                            end
+                        end
+                    end
+                    Logger.log("[ORB OBSERVE] children=" .. childrenCount .. " fragments=" .. fragCount, "info")
+                end
+
+                task.wait(pollInterval)
+                elapsed = elapsed + pollInterval
+            end
+
+            if not orbFound then
+                Logger.log("[ORB OBSERVE] no client-visible Commandment Fragment after " .. maxWait .. "s", "warn")
                 -- Clean up any stale references
                 for inst, info in pairs(State.ObservedSpawnItems) do
                     if not isInstanceValid(inst) and not info.removed and not info.collected then
@@ -2274,14 +2312,16 @@ function Detection.handleTrialFinished()
                         Detection.cleanupOrbInfo(info)
                     end
                 end
-                if State.OrbState == "PENDING" then
+                if State.OrbState == "PENDING" or State.OrbState == "COLLECT_ATTEMPT" then
                     StateMachine.setOrbState("NONE")
                 end
             end
         end
 
         -- Return to IDLE
-        StateMachine.setMainState("IDLE")
+        if State.MainState == "POST_TRIAL" then
+            StateMachine.setMainState("IDLE")
+        end
     end)
 end
 
@@ -2413,7 +2453,6 @@ function Detection.bindSpawnItems()
                 Refs.SpawnItems = child
                 disconnectByTag("spawnitems_wait")
                 Detection.bindSpawnItems()
-                -- Snapshot existing items
                 if State.MonitorOrb then
                     Detection.snapshotOrbs()
                 end
@@ -3656,105 +3695,154 @@ end
 -- SECTION 14: INITIALIZATION
 -- ════════════════════════════════════════════════════════════════
 
+local function waitForStartupReadiness()
+    if not game:IsLoaded() then
+        print("[INIT] waiting for game")
+        game.Loaded:Wait()
+    end
+    
+    if not Players.LocalPlayer then
+        print("[INIT] waiting for LocalPlayer")
+        while not Players.LocalPlayer do task.wait(0.5) end
+    end
+    LocalPlayer = Players.LocalPlayer
+    
+    if not LocalPlayer:FindFirstChild("PlayerGui") then
+        print("[INIT] waiting for PlayerGui")
+        while not LocalPlayer:FindFirstChild("PlayerGui") do task.wait(0.5) end
+    end
+    
+    if not LocalPlayer.Character then
+        print("[INIT] waiting for Character")
+        while not LocalPlayer.Character do task.wait(0.5) end
+    end
+    
+    if not LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+        print("[INIT] waiting for HumanoidRootPart")
+        while not LocalPlayer.Character:FindFirstChild("HumanoidRootPart") do task.wait(0.5) end
+    end
+    
+    print("[INIT] dependencies ready")
+    return true
+end
+
 local function initialize()
-    Logger.log("[SYSTEM] Initializing Anime Breakers HUB...", "system")
+    local initOk, initErr = pcall(function()
+        waitForStartupReadiness()
 
-    -- 1. Load Persisted Settings safely
-    Persistence.load()
+        -- 1. Load Persisted Settings safely
+        Persistence.load()
+        print("[INIT] persistence loaded")
 
-    -- 2. Resolve PlayerGui
-    resolvePlayerGui()
+        -- 2. Resolve PlayerGui early for GUI parent
+        resolvePlayerGui()
 
-    -- 3. Build GUI (this also flushes the log buffer)
-    GuiModule.build()
+        -- 3. Build GUI (this also flushes the log buffer)
+        GuiModule.build()
+        Logger.log("[INIT] GUI built", "system")
 
-    -- 4. Resolve references
-    resolveInvite()
-    resolveGamemodeGui()
-    resolveSpawnItems()
-    resolveEnemiesGamemode()
-    resolveCharacter()
+        -- 4. Resolve references
+        resolveInvite()
+        resolveGamemodeGui()
+        resolveSpawnItems()
+        resolveEnemiesGamemode()
+        resolveCharacter()
 
-    Logger.log("[SYSTEM] References resolved", "system")
-    Logger.log("[SYSTEM]   PlayerGui: " .. (Refs.PlayerGui and "OK" or "MISSING"), "system")
-    Logger.log("[SYSTEM]   Invite: " .. (Refs.Invite and "OK" or "MISSING"), "system")
-    Logger.log("[SYSTEM]   Gamemode GUI: " .. (Refs.Gamemode and "OK" or "MISSING"), "system")
-    Logger.log("[SYSTEM]   _SPAWNITEMS: " .. (Refs.SpawnItems and "OK" or "MISSING"), "system")
-    Logger.log("[SYSTEM]   _ENEMIES.Server.Gamemode: " .. (Refs.EnemiesGamemode and "OK" or "MISSING"), "system")
-    Logger.log("[SYSTEM]   Character: " .. (Refs.Character and "OK" or "MISSING"), "system")
+        Logger.log("[INIT] refs resolved", "system")
+        Logger.log("[SYSTEM]   PlayerGui: " .. (Refs.PlayerGui and "OK" or "MISSING"), "system")
+        Logger.log("[SYSTEM]   Invite: " .. (Refs.Invite and "OK" or "MISSING"), "system")
+        Logger.log("[SYSTEM]   Gamemode GUI: " .. (Refs.Gamemode and "OK" or "MISSING"), "system")
+        Logger.log("[SYSTEM]   _SPAWNITEMS: " .. (Refs.SpawnItems and "OK" or "MISSING"), "system")
+        Logger.log("[SYSTEM]   _ENEMIES.Server.Gamemode: " .. (Refs.EnemiesGamemode and "OK" or "MISSING"), "system")
+        Logger.log("[SYSTEM]   Character: " .. (Refs.Character and "OK" or "MISSING"), "system")
 
-    -- 5. Bind detection listeners
-    Detection.bindPlayerGui()
-    Detection.bindGamemodeFolder()
-    Detection.bindSpawnItems()
-    Detection.bindCharacter()
+        -- 5. Bind detection listeners
+        Detection.bindPlayerGui()
+        Detection.bindGamemodeFolder()
+        Detection.bindSpawnItems()
+        Detection.bindCharacter()
+        Logger.log("[INIT] listeners bound", "system")
 
-    -- 6. Initial snapshots (#50)
-    if State.MonitorTrial then
-        Detection.snapshotTrial()
-    end
-    if State.MonitorOrb then
-        Detection.snapshotOrbs()
-        Detection.updateOrbStateAfterChange()
-    end
-    Detection.recoverTrialWorkerIfNeeded()
-    Arbiter.evaluate()
-
-    -- 7. Start GUI update loop (~1 Hz)
-    task.spawn(function()
-        while not State.HubClosed do
-            local ok, err = pcall(function()
-                GuiModule.updateLoop()
-            end)
-            if not ok then
-                State.LastError = "GUI update error"
-            end
-            task.wait(Config.GuiUpdateInterval)
+        -- 6. Initial snapshots (#50)
+        if State.MonitorTrial then
+            Detection.snapshotTrial()
         end
+        if State.MonitorOrb then
+            Detection.snapshotOrbs()
+            Detection.updateOrbStateAfterChange()
+        end
+        Detection.recoverTrialWorkerIfNeeded()
+        Logger.log("[INIT] snapshots complete", "system")
+
+        Arbiter.evaluate()
+
+        -- 7. Start GUI update loop (~1 Hz)
+        task.spawn(function()
+            while not State.HubClosed do
+                local ok, err = pcall(function()
+                    GuiModule.updateLoop()
+                end)
+                if not ok then
+                    State.LastError = "GUI update error"
+                end
+                task.wait(Config.GuiUpdateInterval)
+            end
+        end)
+
+        -- 8. Retry missing containers periodically
+        task.spawn(function()
+            while not State.HubClosed do
+                task.wait(Config.ContainerResolveRetry)
+                if State.HubClosed then break end
+
+                -- Re-resolve missing refs without spamming logs
+                if not Refs.SpawnItems or not isInstanceValid(Refs.SpawnItems) then
+                    local si = resolveSpawnItems()
+                    if si then
+                        Detection.bindSpawnItems()
+                        if State.MonitorOrb then
+                            Detection.snapshotOrbs()
+                            Detection.updateOrbStateAfterChange()
+                        end
+                    end
+                end
+
+                if not Refs.EnemiesGamemode or not isInstanceValid(Refs.EnemiesGamemode) then
+                    local gm = resolveEnemiesGamemode()
+                    if gm then
+                        Detection.bindGamemodeFolder()
+                        if State.MonitorTrial then
+                            Detection.snapshotTrial()
+                        end
+                    end
+                end
+
+                if not Refs.PlayerGui or not isInstanceValid(Refs.PlayerGui) then
+                    local pg = resolvePlayerGui()
+                    if pg then
+                        Detection.bindPlayerGui()
+                        if State.MonitorTrial then
+                            Detection.snapshotTrial()
+                        end
+                    end
+                end
+            end
+        end)
+
+        -- 9. Init Anti-AFK
+        AntiAfkSystem.init()
+        Logger.log("[INIT] runtime loops started", "system")
+        Logger.log("[INIT] complete", "system")
     end)
 
-    -- 8. Retry missing containers periodically
-    task.spawn(function()
-        while not State.HubClosed do
-            task.wait(Config.ContainerResolveRetry)
-            if State.HubClosed then break end
-
-            -- Re-resolve missing refs without spamming logs
-            if not Refs.SpawnItems or not isInstanceValid(Refs.SpawnItems) then
-                local si = resolveSpawnItems()
-                if si then
-                    Detection.bindSpawnItems()
-                    if State.MonitorOrb then
-                        Detection.snapshotOrbs()
-                        Detection.updateOrbStateAfterChange()
-                    end
-                end
-            end
-
-            if not Refs.EnemiesGamemode or not isInstanceValid(Refs.EnemiesGamemode) then
-                local gm = resolveEnemiesGamemode()
-                if gm then
-                    Detection.bindGamemodeFolder()
-                    if State.MonitorTrial then
-                        Detection.snapshotTrial()
-                    end
-                end
-            end
-
-            if not Refs.PlayerGui or not isInstanceValid(Refs.PlayerGui) then
-                local pg = resolvePlayerGui()
-                if pg then
-                    Detection.bindPlayerGui()
-                    if State.MonitorTrial then
-                        Detection.snapshotTrial()
-                    end
-                end
-            end
+    if not initOk then
+        warn("[INIT ERROR] error=" .. tostring(initErr))
+        if Logger.log then
+            Logger.log("[INIT ERROR] error=" .. tostring(initErr), "error")
         end
-    end)
-
-    -- 9. Init Anti-AFK
-    AntiAfkSystem.init()
+        GuiModule.close()
+        return
+    end
 
     Logger.log("[SYSTEM] HUB initialized — Main: " .. State.MainState .. " | Orb: " .. State.OrbState, "system")
     Logger.log("[SYSTEM] All systems active — Raid guard ON, lifecycle farm, distance-verified orb", "system")

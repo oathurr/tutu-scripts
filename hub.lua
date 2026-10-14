@@ -1,14 +1,17 @@
 --[[
-    STAR BATCH PROFILER v2 (READ-ONLY)
+    STAR SPEED PROFILER v3 (PITY TRUTH + A/B CLIENT SPEED TEST)
     Jogo alvo: Anime Legacy Simulator
-    Objetivo: Medir exclusivamente os CICLOS DE ABERTURA (Batches) e o intervalo exato
-              permitido entre o início de uma abertura e a próxima.
+    Fonte de verdade: PlayerGui.UI.Frames.Star.Pity.Value ("Mythical Pity: 5085/7500")
+    Objetivo: Verificar se a aceleração de animações locais altera o intervalo real
+              de atualização do Pity (~1.00s baseline) e comparar modos (NORMAL, 2x, 5x, 10x).
 ]]
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local CoreGui = game:GetService("CoreGui")
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
@@ -17,102 +20,90 @@ local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 -- CONFIGURAÇÕES PRINCIPAIS
 -- ============================================================================
 local DEBUG = true
+local SPEED_TEST = true
+local SPEED_MULTIPLIER = 2 -- Opções na UI: 1 (NORMAL), 2, 5, 10
+local BASELINE_SECONDS = 1.000
+local DEFAULT_BATCH_DELTA = 9 -- Usado apenas se o Pity resetar no meio de um giro (ex: 7500/7500 -> 0/7500)
 
--- Janela de deduplicação (em segundos). Como a abertura normal leva ~1.27s,
--- 0.45s garante que sinais atrasados da mesma abertura sejam ignorados sem bloquear o próximo ciclo.
-local DEDUP_WINDOW = 0.45
+-- Janela mínima para ignorar micro-atualizações de texto duplicadas no mesmo frame
+local PITY_DEDUP_WINDOW = 0.08
 
--- Quando true, o profiler trava automaticamente no sinal mais confiável de início de abertura
--- (priorizando Pity > Atributo > ScreenGui/Frame raiz) para medir sempre o mesmo ponto do ciclo.
-local AUTO_ANCHOR = true
-
--- Caso queira travar manualmente em um caminho específico visto no F9, coloque a string aqui:
-local MANUAL_LOCKED_PATH: string? = nil
-
--- Controle de quais sinais podem contar uma ABERTURA (true) vs APENAS DEBUG (false)
-local SIGNAL_CONFIG = {
-	-- Sinais primários (acontecem 1 vez no início do ciclo)
-	Pity = true,
-	AttrCounter = true,
-	ScreenGuiEnabled = true,
-	GuiVisible = true,
-
-	-- Sinais secundários (APENAS DEBUG - nunca aumentam a contagem de aberturas)
-	ChildAdded = false,
-	ImageChange = false,
-	TextChange = false,
-	Currency = false,
-}
-
--- Prioridade dos sinais para o AUTO_ANCHOR (quanto maior, mais confiável como início de ciclo)
-local SIGNAL_PRIORITY: {[string]: number} = {
-	Pity = 4,
-	AttrCounter = 3,
-	ScreenGuiEnabled = 2,
-	GuiVisible = 1,
-}
-
-local GACHA_KEYWORDS = {
-	"star", "summon", "roll", "open", "hatch", "gacha",
-	"pity", "result", "unit", "character", "capsule", "banner", "pull"
-}
-
-local IGNORE_KEYWORDS = {
-	"timer", "cooldown", "fps", "ping", "clock", "timeleft",
-	"refresh", "reset", "chat", "bubble", "health", "xp", "quest", "index"
-}
-
--- Evita que sub-elementos de cartas/slots acionem GuiVisible como se fossem a janela principal
-local CARD_SUBELEMENT_KEYWORDS = {
-	"template", "card", "slot", "grid", "viewport", "icon", "rarity", "shiny"
+local STAR_KEYWORDS = {
+	"star", "summon", "roll", "open", "hatch", "gacha", "capsule", "egg", "result", "banner"
 }
 
 -- ============================================================================
--- ESTADO DO TESTE E HISTÓRICO
+-- ESTRUTURAS DE DADOS E COMPARAÇÃO A/B
 -- ============================================================================
-export type OpeningEntry = {
-	opening: number,
-	timestamp: number,
-	interval: number?,
-	source: string,
-	signalType: string,
+export type ModeStats = {
+	name: string,
+	multiplier: number,
+	openings: number,
+	realRolls: number,
+	lastInterval: number,
+	minInterval: number,
+	maxInterval: number,
+	intervals: {number},
+	activeTime: number,
+}
+
+local MODES_ORDER = { "NORMAL", "2x", "5x", "10x" }
+local MULTIPLIER_TO_MODE: {[number]: string} = {
+	[1] = "NORMAL",
+	[2] = "2x",
+	[5] = "5x",
+	[10] = "10x",
+}
+
+local function createEmptyModeStats(name: string, mult: number): ModeStats
+	return {
+		name = name,
+		multiplier = mult,
+		openings = 0,
+		realRolls = 0,
+		lastInterval = 0,
+		minInterval = math.huge,
+		maxInterval = 0,
+		intervals = {},
+		activeTime = 0,
+	}
+end
+
+local ABData: {[string]: ModeStats} = {
+	["NORMAL"] = createEmptyModeStats("NORMAL", 1),
+	["2x"]     = createEmptyModeStats("2x", 2),
+	["5x"]     = createEmptyModeStats("5x", 5),
+	["10x"]    = createEmptyModeStats("10x", 10),
 }
 
 local State = {
 	IsRunning = false,
-	StartTime = 0,
-	ElapsedTime = 0,
+	LastTick = os.clock(),
+	LastPityTimestamp = nil :: number?,
+	LastPityValue = nil :: number?,
+	LastPityMax = nil :: number?,
+	PityObject = nil :: Instance?,
+	PityResolvedPath = "Procurando...",
 
-	TotalOpenings = 0,
-	LastOpeningTimestamp = nil :: number?,
-
-	-- Âncora automática para garantir medição do mesmo evento a cada ciclo
-	AnchorPath = nil :: string?,
-	AnchorType = nil :: string?,
-	AnchorPriority = 0,
-
-	MinInterval = math.huge,
-	MaxInterval = 0,
-	LastInterval = 0,
-
-	Intervals = {} :: {number},
-	OpeningHistory = {} :: {OpeningEntry},
+	AcceleratedTracksCount = 0,
+	DetectedAnimControllers = {} :: {[string]: boolean},
 }
 
 local Connections = {} :: {RBXScriptConnection}
-local WatchedInstances = {} :: {[Instance]: boolean}
+local WatchedAnimators = {} :: {[Instance]: boolean}
 
 -- ============================================================================
--- FUNÇÕES UTILITÁRIAS E FILTROS
+-- UTILITÁRIOS (CORREÇÃO DO BUG DE PATH DUPLICADO)
 -- ============================================================================
+-- Agora retorna o caminho limpo sem duplicar "PlayerGui.PlayerGui"
 local function getCleanPath(inst: Instance): string
-	local path = inst.Name
-	local current = inst.Parent
+	local parts = {}
+	local current: Instance? = inst
 	while current and current ~= game and current ~= LocalPlayer do
-		path = current.Name .. "." .. path
+		table.insert(parts, 1, current.Name)
 		current = current.Parent
 	end
-	return path
+	return table.concat(parts, ".")
 end
 
 local function containsKeyword(str: string, list: {string}): boolean
@@ -125,392 +116,466 @@ local function containsKeyword(str: string, list: {string}): boolean
 	return false
 end
 
-local function isRelevantPath(path: string): boolean
-	if string.find(path, "StarSpeedProfilerUI", 1, true) then
-		return false
+local function getCurrentModeName(): string
+	if not SPEED_TEST or SPEED_MULTIPLIER <= 1 then
+		return "NORMAL"
 	end
-	if containsKeyword(path, IGNORE_KEYWORDS) then
-		return false
-	end
-	return containsKeyword(path, GACHA_KEYWORDS)
+	return MULTIPLIER_TO_MODE[SPEED_MULTIPLIER] or (tostring(SPEED_MULTIPLIER) .. "x")
 end
 
-local function looksLikeTimerText(text: string): boolean
-	if string.match(text, "^%d+:%d+") then return true end
-	if string.match(string.lower(text), "%d+%s*[hms]%s+%d+%s*[hms]") then return true end
-	return false
+local function getCurrentModeStats(): ModeStats
+	local modeName = getCurrentModeName()
+	if not ABData[modeName] then
+		ABData[modeName] = createEmptyModeStats(modeName, SPEED_TEST and SPEED_MULTIPLIER or 1)
+	end
+	return ABData[modeName]
 end
 
-local function parsePityText(text: string): (number?, number?)
+-- Extrai (atual, máximo) de textos como "Mythical Pity: 5085/7500"
+local function parsePityNumbers(text: string): (number?, number?)
 	local cur, max = string.match(text, "(%d+)%s*/%s*(%d+)")
 	if cur and max then
 		return tonumber(cur), tonumber(max)
 	end
-	if containsKeyword(text, {"pity"}) then
-		local single = string.match(text, "(%d+)")
-		if single then
-			return tonumber(single), nil
-		end
+	local single = string.match(text, "(%d+)")
+	if single then
+		return tonumber(single), nil
 	end
 	return nil, nil
 end
 
-local function debugPrint(signalType: string, path: string, details: string, isTrigger: boolean)
-	if not DEBUG then return end
-	local now = os.clock()
-	local relTimeStr = ""
-	if State.LastOpeningTimestamp then
-		relTimeStr = string.format(" (+%.3fs após última abertura)", now - State.LastOpeningTimestamp)
+-- ============================================================================
+-- ESTATÍSTICAS E CLASSIFICAÇÃO DE GANHO REAL (ANTI-OUTLIER)
+-- ============================================================================
+local function getAverage(list: {number}): number
+	if #list == 0 then return 0 end
+	local sum = 0
+	for _, v in ipairs(list) do
+		sum += v
 	end
-	local tag = isTrigger and "[TRIGGER DE ABERTURA]" or "[DEBUG - IGNORADO NA CONTAGEM]"
-	print(string.format("%s [%s]%s\nCaminho: %s\n%s", tag, signalType, relTimeStr, path, details))
+	return sum / #list
+end
+
+-- Retorna o 2º menor intervalo para evitar que um único outlier distorça o diagnóstico
+local function getRobustMinInterval(intervals: {number}): number
+	local n = #intervals
+	if n == 0 then return 0 end
+	local copy = table.clone(intervals)
+	table.sort(copy)
+	if n >= 4 then
+		return copy[2] -- Ignora o 1º valor isolado se houver amostra suficiente
+	end
+	return copy[1]
+end
+
+local function classifyModeResult(stats: ModeStats): string
+	if stats.openings < 10 or #stats.intervals < 9 then
+		return string.format("AGUARDANDO DADOS (%d/10)", stats.openings)
+	end
+
+	local below070 = 0
+	local between070And095 = 0
+
+	for _, iv in ipairs(stats.intervals) do
+		if iv < 0.70 then
+			below070 += 1
+		elseif iv < 0.95 then
+			between070And095 += 1
+		end
+	end
+
+	-- Exige pelo menos 3 ocorrências consistentes (não considera um único outlier)
+	if below070 >= 3 then
+		return "GANHO REAL CONFIRMADO"
+	elseif (below070 + between070And095) >= 3 then
+		return "POSSÍVEL GANHO REAL"
+	else
+		return "SEM GANHO REAL / APENAS VISUAL"
+	end
+end
+
+local function getImprovementPercent(stats: ModeStats): number
+	if #stats.intervals == 0 then return 0 end
+	local avg = getAverage(stats.intervals)
+	local refBaseline = BASELINE_SECONDS
+	local normalStats = ABData["NORMAL"]
+	if stats.name ~= "NORMAL" and #normalStats.intervals >= 5 then
+		refBaseline = getAverage(normalStats.intervals)
+	end
+	return ((refBaseline - avg) / refBaseline) * 100
 end
 
 -- ============================================================================
--- NÚCLEO DE DETECÇÃO DE ABERTURA (1 CICLO = 1 ABERTURA)
+-- INSPETOR E ACELERADOR CLIENT-SIDE (ANIMAÇÕES & CONTROLES DE STAR)
 -- ============================================================================
-local function handleSignal(signalType: string, sourcePath: string, details: string)
-	local canTrigger = SIGNAL_CONFIG[signalType] == true
-
-	-- 1. Se for ChildAdded, ImageChange, TextChange ou Currency, apenas imprime no DEBUG e sai
-	if not canTrigger then
-		debugPrint(signalType, sourcePath, details, false)
-		return
+local function getEffectiveSpeed(): number
+	if not SPEED_TEST then
+		return 1
 	end
+	return SPEED_MULTIPLIER
+end
 
-	-- 2. Verifica filtro manual, se configurado
-	if MANUAL_LOCKED_PATH and sourcePath ~= MANUAL_LOCKED_PATH then
-		debugPrint(signalType, sourcePath, details .. " (Ignorado por MANUAL_LOCKED_PATH)", false)
-		return
-	end
+local function applySpeedToTrack(track: AnimationTrack, animatorPath: string)
+	local targetSpeed = getEffectiveSpeed()
+	if targetSpeed <= 1 then return end
 
-	local now = os.clock()
-	local priority = SIGNAL_PRIORITY[signalType] or 1
-
-	-- 3. Verifica se estamos dentro da janela de deduplicação da abertura atual
-	if State.LastOpeningTimestamp and (now - State.LastOpeningTimestamp) <= DEDUP_WINDOW then
-		-- Se um sinal de prioridade MAIOR (ex: Pity) disparar poucos milissegundos após
-		-- um GuiVisible no primeiro giro, promovemos o Pity para ser a Âncora oficial
-		-- sem somar uma nova abertura!
-		if AUTO_ANCHOR and not MANUAL_LOCKED_PATH and priority > State.AnchorPriority then
-			State.AnchorPath = sourcePath
-			State.AnchorType = signalType
-			State.AnchorPriority = priority
-			debugPrint(signalType, sourcePath, details .. " -> [PROMOVIDO A SINAL ÂNCORA]", true)
-		else
-			debugPrint(signalType, sourcePath, details .. " (Deduplicado dentro da janela)", false)
+	pcall(function()
+		if math.abs(track.Speed - targetSpeed) > 0.01 then
+			track:AdjustSpeed(targetSpeed)
+			State.AcceleratedTracksCount += 1
+			if DEBUG then
+				local animId = track.Animation and track.Animation.AnimationId or "Desconhecido"
+				print(string.format(
+					"[SPEED TEST %dx] AnimationTrack acelerada!\n  Animator: %s\n  AnimationId: %s\n  Duração original: %.3fs",
+					targetSpeed, animatorPath, animId, track.Length
+				))
+			end
 		end
+	end)
+end
+
+local function shouldAccelerateAnimator(animator: Instance): (boolean, string)
+	local path = getCleanPath(animator)
+	-- Ignora o próprio personagem do jogador andando pelo mapa, a menos que seja uma animação de Star
+	if LocalPlayer.Character and animator:IsDescendantOf(LocalPlayer.Character) then
+		return false, path
+	end
+	-- Prioriza tudo dentro de PlayerGui (ViewportFrames de Star) ou objetos de Star/Camera no Workspace
+	if animator:IsDescendantOf(PlayerGui) then
+		return true, path
+	end
+	if Workspace.CurrentCamera and animator:IsDescendantOf(Workspace.CurrentCamera) then
+		return true, path
+	end
+	if containsKeyword(path, STAR_KEYWORDS) then
+		return true, path
+	end
+	return false, path
+end
+
+local function watchAnimator(animator: Instance)
+	if WatchedAnimators[animator] then return end
+	if not (animator:IsA("Animator") or animator:IsA("AnimationController") or animator:IsA("Humanoid")) then
 		return
 	end
 
-	-- 4. Lógica de Sinal Âncora (garante que apenas 1 único objeto marque os ciclos)
-	if AUTO_ANCHOR and not MANUAL_LOCKED_PATH then
-		if State.AnchorPath == nil then
-			State.AnchorPath = sourcePath
-			State.AnchorType = signalType
-			State.AnchorPriority = priority
-		elseif sourcePath ~= State.AnchorPath then
-			-- Se aparecer um sinal de prioridade mais alta (ex: Pity), assume a âncora;
-			-- caso contrário, ignora sinais paralelos fora de hora.
-			if priority > State.AnchorPriority then
-				State.AnchorPath = sourcePath
-				State.AnchorType = signalType
-				State.AnchorPriority = priority
-			else
-				debugPrint(signalType, sourcePath, details .. " (Ignorado: diferente do Sinal Âncora)", false)
-				return
+	local relevant, path = shouldAccelerateAnimator(animator)
+	if not relevant then return end
+
+	WatchedAnimators[animator] = true
+	State.DetectedAnimControllers[path] = true
+
+	if DEBUG then
+		print(string.format("[DEBUG ANIMAÇÃO] Controlador 3D detectado: %s (%s)", path, animator.ClassName))
+	end
+
+	-- Acelera tracks que já estejam tocando
+	pcall(function()
+		local tracks = (animator :: any):GetPlayingAnimationTracks()
+		for _, track in ipairs(tracks) do
+			applySpeedToTrack(track, path)
+		end
+	end)
+
+	-- Escuta novas animações iniciadas
+	local conn = (animator :: any).AnimationPlayed:Connect(function(track: AnimationTrack)
+		applySpeedToTrack(track, path)
+	end)
+	table.insert(Connections, conn)
+end
+
+-- Atualiza a velocidade das animações em andamento caso o usuário mude o botão (1x, 2x, 5x, 10x)
+local function refreshAllPlayingTracks()
+	local targetSpeed = getEffectiveSpeed()
+	for animator in pairs(WatchedAnimators) do
+		if animator and animator.Parent then
+			pcall(function()
+				for _, track in ipairs((animator :: any):GetPlayingAnimationTracks()) do
+					track:AdjustSpeed(targetSpeed)
+				end
+			end)
+		end
+	end
+end
+
+-- Diagnostica quais scripts e objetos controlam a GUI da Star
+local function inspectStarGuiArchitecture()
+	local uiScreen = PlayerGui:FindFirstChild("UI")
+	local frames = uiScreen and uiScreen:FindFirstChild("Frames")
+	local starFrame = frames and frames:FindFirstChild("Star")
+
+	print("\n===== DIAGNÓSTICO DE ARQUITETURA DA STAR =====")
+	if not starFrame then
+		print("[AVISO] PlayerGui.UI.Frames.Star ainda não encontrado.")
+	else
+		print("Container localizado: " .. getCleanPath(starFrame))
+		local scriptsFound = 0
+		local viewportsFound = 0
+
+		for _, desc in ipairs(starFrame:GetDescendants()) do
+			if desc:IsA("LocalScript") or desc:IsA("ModuleScript") then
+				scriptsFound += 1
+				print("  [Script na UI] " .. getCleanPath(desc) .. " (" .. desc.ClassName .. ")")
+			elseif desc:IsA("ViewportFrame") or desc:IsA("WorldModel") then
+				viewportsFound += 1
+				print("  [Viewport/3D na UI] " .. getCleanPath(desc) .. " (" .. desc.ClassName .. ")")
+			elseif desc:IsA("Animator") or desc:IsA("AnimationController") or desc:IsA("Humanoid") then
+				watchAnimator(desc)
+			end
+		end
+
+		print(string.format("Resumo em Frames.Star: %d Scripts locais | %d ViewportFrames/WorldModels", scriptsFound, viewportsFound))
+	end
+
+	-- Procura também Scripts/Modules em PlayerGui ou ReplicatedStorage com nome de Star/Summon/Roll
+	for _, container in ipairs({PlayerGui, ReplicatedStorage}) do
+		for _, desc in ipairs(container:GetDescendants()) do
+			if (desc:IsA("LocalScript") or desc:IsA("ModuleScript")) and containsKeyword(desc.Name, STAR_KEYWORDS) then
+				local p = getCleanPath(desc)
+				if not State.DetectedAnimControllers[p] then
+					State.DetectedAnimControllers[p] = true
+					print("  [Controlador Relacionado] " .. p .. " (" .. desc.ClassName .. ")")
+				end
 			end
 		end
 	end
+	print("Nota: Tweens criados via TweenService:Create() dentro de LocalScripts são isolados na memória do script.")
+	print("==============================================\n")
+end
 
-	debugPrint(signalType, sourcePath, details, true)
+-- ============================================================================
+-- DETECTOR OFICIAL: PITY COMO FONTE DE VERDADE
+-- ============================================================================
+local function onPityRawTextChanged(newRawText: string)
+	local newCur, newMax = parsePityNumbers(newRawText)
+	if not newCur then return end
 
-	-- Só registra nas métricas se o botão [START] estiver ativo
-	if not State.IsRunning then
+	-- Inicialização da primeira leitura (apenas sincroniza o valor atual sem contar abertura)
+	if State.LastPityValue == nil then
+		State.LastPityValue = newCur
+		State.LastPityMax = newMax
+		if DEBUG then
+			print(string.format("[PITY SYNC] Valor inicial sincronizado: %d/%s", newCur, tostring(newMax or "?")))
+		end
 		return
+	end
+
+	local oldCur = State.LastPityValue
+	local oldMax = State.LastPityMax or newMax
+	if newCur == oldCur then return end
+
+	local now = os.clock()
+	if State.LastPityTimestamp and (now - State.LastPityTimestamp) < PITY_DEDUP_WINDOW then
+		State.LastPityValue = newCur
+		State.LastPityMax = newMax
+		return
+	end
+
+	-- Calcula o Delta real de Rolls
+	local delta = newCur - oldCur
+	if delta <= 0 then
+		-- Tratamento para caso o Mythical Pity resete (ex: bateu 7500/7500 ou pegou o Mythical)
+		if oldMax and ((oldMax - oldCur) + newCur) > 0 and ((oldMax - oldCur) + newCur) <= 20 then
+			delta = (oldMax - oldCur) + newCur
+		elseif newCur > 0 and newCur <= 20 then
+			delta = newCur
+		else
+			delta = DEFAULT_BATCH_DELTA
+		end
+		if DEBUG then
+			print(string.format("[PITY RESET DETECTADO] %d -> %d (Assumindo Delta = +%d)", oldCur, newCur, delta))
+		end
 	end
 
 	local interval: number? = nil
-	if State.LastOpeningTimestamp ~= nil then
-		interval = now - State.LastOpeningTimestamp
-		State.LastInterval = interval
-		table.insert(State.Intervals, interval)
+	if State.LastPityTimestamp ~= nil then
+		interval = now - State.LastPityTimestamp
+	end
 
-		if interval < State.MinInterval then
-			State.MinInterval = interval
+	State.LastPityValue = newCur
+	State.LastPityMax = newMax
+	State.LastPityTimestamp = now
+
+	-- Log detalhado exigido no F9
+	if DEBUG then
+		print(string.format(
+			"Pity: %d -> %d\nDelta: +%d\nIntervalo: %s\nRolls reais: +%d\nModo: %s",
+			oldCur,
+			newCur,
+			delta,
+			interval and string.format("%.3fs", interval) or "1ª abertura (baseline timestamp)",
+			delta,
+			getCurrentModeName()
+		))
+	end
+
+	-- Se o cronômetro estiver ativo ([START]), grava nas métricas do modo A/B atual
+	if State.IsRunning then
+		local stats = getCurrentModeStats()
+		stats.openings += 1
+		stats.realRolls += delta
+
+		if interval then
+			stats.lastInterval = interval
+			table.insert(stats.intervals, interval)
+			if interval < stats.minInterval then
+				stats.minInterval = interval
+			end
+			if interval > stats.maxInterval then
+				stats.maxInterval = interval
+			end
 		end
-		if interval > State.MaxInterval then
-			State.MaxInterval = interval
+	end
+end
+
+local function connectPitySource()
+	-- 1. Tenta localizar exatamente PlayerGui.UI.Frames.Star.Pity.Value
+	local target: Instance? = nil
+	local ui = PlayerGui:FindFirstChild("UI")
+	local frames = ui and ui:FindFirstChild("Frames")
+	local star = frames and frames:FindFirstChild("Star")
+	local pity = star and star:FindFirstChild("Pity")
+	if pity then
+		target = pity:FindFirstChild("Value") or (pity:IsA("TextLabel") and pity or nil)
+	end
+
+	-- 2. Fallback automático caso a hierarquia demore a carregar
+	if not target then
+		for _, desc in ipairs(PlayerGui:GetDescendants()) do
+			if desc:IsA("TextLabel") and string.find(string.lower(desc.Text), "pity") then
+				target = desc
+				break
+			end
 		end
 	end
 
-	State.LastOpeningTimestamp = now
-	State.TotalOpenings += 1
-
-	table.insert(State.OpeningHistory, {
-		opening = State.TotalOpenings,
-		timestamp = now,
-		interval = interval,
-		source = sourcePath,
-		signalType = signalType,
-	})
-end
-
--- ============================================================================
--- DETECTORES PASSIVOS
--- ============================================================================
-
--- Detector de TextLabels: Separa Pity (Trigger Primário) de TextChange comum (Apenas Debug)
-local function watchTextLabel(label: TextLabel, path: string)
-	local lastText = label.Text
-	local isPityLabel = (parsePityText(lastText) ~= nil) or containsKeyword(path, {"pity"})
-	local isPathRelevant = isRelevantPath(path)
-
-	local conn = label:GetPropertyChangedSignal("Text"):Connect(function()
-		local newText = label.Text
-		if newText == lastText or newText == "" then return end
-		if looksLikeTimerText(newText) then
-			lastText = newText
-			return
-		end
-
-		local oldCur, _ = parsePityText(lastText)
-		local newCur, _ = parsePityText(newText)
-		local prevStr = lastText
-		lastText = newText
-
-		-- Se for contador de Pity (ex: 20/100 -> 26/100), dispara APENAS 1 abertura
-		if (oldCur and newCur and oldCur ~= newCur) or isPityLabel then
-			handleSignal("Pity", path, string.format("Anterior: %s | Novo: %s", prevStr, newText))
-			return
-		end
-
-		-- Demais textos relevantes ficam estritamente como TextChange (APENAS DEBUG)
-		if isPathRelevant then
-			handleSignal("TextChange", path, string.format("Anterior: %s | Novo: %s", prevStr, newText))
-		end
-	end)
-
-	table.insert(Connections, conn)
-end
-
--- Detector de Moedas (Estritamente DEBUG nesta versão)
-local function watchValueObject(valObj: ValueBase, path: string)
-	if not (valObj:IsA("NumberValue") or valObj:IsA("IntValue")) then return end
-	if containsKeyword(path, IGNORE_KEYWORDS) then return end
-
-	local numObj = valObj :: NumberValue
-	local lastVal = numObj.Value
-
-	local conn = numObj:GetPropertyChangedSignal("Value"):Connect(function()
-		local newVal = numObj.Value
-		local diff = newVal - lastVal
-		local prevVal = lastVal
-		lastVal = newVal
-
-		if diff < 0 then
-			handleSignal("Currency", path, string.format("%s -> %s (Delta: %s)", tostring(prevVal), tostring(newVal), tostring(diff)))
-		end
-	end)
-
-	table.insert(Connections, conn)
-end
-
--- Detector de Atributos do LocalPlayer
-local function watchPlayerAttributes()
-	local lastAttrs = LocalPlayer:GetAttributes()
-
-	local conn = LocalPlayer.AttributeChanged:Connect(function(attrName: string)
-		local newVal = LocalPlayer:GetAttribute(attrName)
-		local oldVal = lastAttrs[attrName]
-		lastAttrs[attrName] = newVal
-
-		local attrPath = "LocalPlayer.Attribute." .. attrName
-
-		if typeof(newVal) == "number" and typeof(oldVal) == "number" then
-			if containsKeyword(attrName, {"pity", "roll", "star", "summon", "hatch", "open"}) and newVal > oldVal then
-				handleSignal("AttrCounter", attrPath, string.format("%s -> %s", tostring(oldVal), tostring(newVal)))
-			elseif newVal < oldVal and not containsKeyword(attrName, IGNORE_KEYWORDS) then
-				handleSignal("Currency", attrPath, string.format("%s -> %s", tostring(oldVal), tostring(newVal)))
-			end
-		end
-	end)
-
-	table.insert(Connections, conn)
-end
-
--- Detector de Objetos de GUI
-local function watchGuiObject(guiObj: Instance, path: string)
-	if WatchedInstances[guiObj] then return end
-	WatchedInstances[guiObj] = true
-
-	if guiObj:IsA("TextLabel") then
-		watchTextLabel(guiObj, path)
+	if not target then
+		State.PityResolvedPath = "NÃO ENCONTRADO (Clique em RECALIBRAR com a Star aberta)"
+		warn("[STAR PROFILER v3] PlayerGui.UI.Frames.Star.Pity.Value não encontrado no momento.")
+		return
 	end
 
-	if not isRelevantPath(path) then return end
+	State.PityObject = target
+	State.PityResolvedPath = getCleanPath(target)
 
-	-- ScreenGui ativada (Início de Abertura)
-	if guiObj:IsA("ScreenGui") then
-		local conn = guiObj:GetPropertyChangedSignal("Enabled"):Connect(function()
-			if guiObj.Enabled then
-				handleSignal("ScreenGuiEnabled", path, "Enabled = true")
-			end
+	if target:IsA("TextLabel") then
+		State.LastPityValue, State.LastPityMax = parsePityNumbers(target.Text)
+		local conn = target:GetPropertyChangedSignal("Text"):Connect(function()
+			onPityRawTextChanged(target.Text)
 		end)
 		table.insert(Connections, conn)
-
-	-- Frame/GuiObject ficando visível
-	elseif guiObj:IsA("GuiObject") then
-		local conn = guiObj:GetPropertyChangedSignal("Visible"):Connect(function()
-			if guiObj.Visible then
-				-- Se for um card/slot interno de personagem, trata apenas como DEBUG
-				if containsKeyword(path, CARD_SUBELEMENT_KEYWORDS) then
-					debugPrint("GuiVisibleSubElement", path, "Visible = true (Sub-elemento de carta)", false)
-				elseif containsKeyword(path, {"result", "summon", "roll", "hatch", "open", "star"}) then
-					handleSignal("GuiVisible", path, "Visible = true")
-				end
-			end
+	elseif target:IsA("ValueBase") then
+		local valObj = target :: any
+		State.LastPityValue, State.LastPityMax = parsePityNumbers(tostring(valObj.Value))
+		local conn = valObj:GetPropertyChangedSignal("Value"):Connect(function()
+			onPityRawTextChanged(tostring(valObj.Value))
 		end)
 		table.insert(Connections, conn)
 	end
 
-	-- Mudança de Imagem (Estritamente DEBUG)
-	if guiObj:IsA("ImageLabel") and containsKeyword(path, {"result", "unit", "character", "icon", "viewport"}) then
-		local lastImg = guiObj.Image
-		local conn = guiObj:GetPropertyChangedSignal("Image"):Connect(function()
-			local newImg = guiObj.Image
-			if newImg ~= lastImg and newImg ~= "" then
-				local prevImg = lastImg
-				lastImg = newImg
-				handleSignal("ImageChange", path, string.format("Anterior: %s | Novo: %s", prevImg, newImg))
-			end
-		end)
-		table.insert(Connections, conn)
-	end
-
-	-- ChildAdded (Estritamente DEBUG)
-	if guiObj:IsA("GuiObject") or guiObj:IsA("Folder") or guiObj:IsA("ScreenGui") then
-		local conn = guiObj.ChildAdded:Connect(function(child)
-			if child:IsA("UILayout") or child:IsA("UIConstraint") or child:IsA("UICorner") or child:IsA("UIStroke") then
-				return
-			end
-			local childPath = path .. "." .. child.Name
-			if containsKeyword(childPath, {"result", "unit", "character", "card", "template", "star", "summon", "roll"}) then
-				handleSignal("ChildAdded", childPath, "Classe: " .. child.ClassName)
-			end
-		end)
-		table.insert(Connections, conn)
-	end
+	print(string.format("[STAR PROFILER v3] Fonte de verdade conectada: %s (Pity atual: %s)", State.PityResolvedPath, tostring(State.LastPityValue or "?")))
 end
 
 -- ============================================================================
--- ESCANEAMENTO E RECALIBRAÇÃO
+-- INICIALIZAÇÃO DE MONITORAMENTO
 -- ============================================================================
-local function clearWatchers()
+local function clearConnections()
 	for _, conn in ipairs(Connections) do
 		if conn.Connected then
 			conn:Disconnect()
 		end
 	end
 	table.clear(Connections)
-	table.clear(WatchedInstances)
+	table.clear(WatchedAnimators)
 end
 
-local function scanAndConnect()
-	clearWatchers()
+local function scanAndConnectAll()
+	clearConnections()
+	connectPitySource()
+	inspectStarGuiArchitecture()
 
-	for _, desc in ipairs(PlayerGui:GetDescendants()) do
-		watchGuiObject(desc, "PlayerGui." .. getCleanPath(desc))
+	-- Monitora Animators existentes e futuros em PlayerGui e Workspace
+	for _, inst in ipairs(PlayerGui:GetDescendants()) do
+		watchAnimator(inst)
+	end
+	for _, inst in ipairs(Workspace:GetDescendants()) do
+		watchAnimator(inst)
 	end
 
-	local pgAddedConn = PlayerGui.DescendantAdded:Connect(function(desc)
-		watchGuiObject(desc, "PlayerGui." .. getCleanPath(desc))
-	end)
-	table.insert(Connections, pgAddedConn)
-
-	for _, desc in ipairs(LocalPlayer:GetDescendants()) do
-		if desc:IsA("ValueBase") and not desc:IsDescendantOf(PlayerGui) then
-			watchValueObject(desc, "LocalPlayer." .. getCleanPath(desc))
+	table.insert(Connections, PlayerGui.DescendantAdded:Connect(function(desc)
+		watchAnimator(desc)
+		if State.PityObject == nil and desc.Name == "Value" and desc.Parent and desc.Parent.Name == "Pity" then
+			connectPitySource()
 		end
-	end
+	end))
 
-	local lpAddedConn = LocalPlayer.DescendantAdded:Connect(function(desc)
-		if desc:IsA("ValueBase") and not desc:IsDescendantOf(PlayerGui) then
-			watchValueObject(desc, "LocalPlayer." .. getCleanPath(desc))
-		end
-	end)
-	table.insert(Connections, lpAddedConn)
-
-	watchPlayerAttributes()
-
-	if DEBUG then
-		print("[STAR PROFILER v2] Monitorando ABERTURAS (ChildAdded/Text/Image/Currency = apenas DEBUG).")
-	end
+	table.insert(Connections, Workspace.DescendantAdded:Connect(function(desc)
+		watchAnimator(desc)
+	end))
 end
 
 -- ============================================================================
--- CÁLCULO DE MÉTRICAS E RELATÓRIO FINAL
+-- RELATÓRIO FINAL E COMPARATIVO A/B NO CONSOLE (F9)
 -- ============================================================================
-local function getRollingWindowCounts(now: number): (number, number, number)
-	local c10, c30, c60 = 0, 0, 0
-	for i = #State.OpeningHistory, 1, -1 do
-		local entry = State.OpeningHistory[i]
-		local age = now - entry.timestamp
-		if age <= 10 then
-			c10 += 1
-			c30 += 1
-			c60 += 1
-		elseif age <= 30 then
-			c30 += 1
-			c60 += 1
-		elseif age <= 60 then
-			c60 += 1
+local function printABReport()
+	print("\n================ STAR SPEED PROFILER v3 (RELATÓRIO A/B) ================")
+	print(string.format("Fonte de verdade: %s", State.PityResolvedPath))
+	print(string.format("AnimationTracks aceleradas na sessão: %d", State.AcceleratedTracksCount))
+	print("------------------------------------------------------------------------")
+
+	for _, modeName in ipairs(MODES_ORDER) do
+		local st = ABData[modeName]
+		if st and st.openings > 0 then
+			local avg = getAverage(st.intervals)
+			local minInt = (st.minInterval == math.huge) and 0 or st.minInterval
+			local maxInt = st.maxInterval
+			local opm = (st.activeTime > 0) and ((st.openings / st.activeTime) * 60) or 0
+			local rpm = (st.activeTime > 0) and ((st.realRolls / st.activeTime) * 60) or 0
+			local verdict = classifyModeResult(st)
+
+			print(string.format(
+				"[%s] Aberturas: %d | Rolls Reais: %d | Tempo: %.2fs\n" ..
+				"  Média: %.3fs | Menor: %.3fs (Robusto: %.3fs) | Maior: %.3fs\n" ..
+				"  Aberturas/min: %.1f | Rolls/min: %.1f | Diagnóstico: %s",
+				modeName, st.openings, st.realRolls, st.activeTime,
+				avg, minInt, getRobustMinInterval(st.intervals), maxInt,
+				opm, rpm, verdict
+			))
 		else
-			break
+			print(string.format("[%s] Sem dados coletados", modeName))
 		end
 	end
-	return c10, c30, c60
-end
 
-local function getAverageInterval(): number
-	if #State.Intervals == 0 then return 0 end
-	local sum = 0
-	for _, v in ipairs(State.Intervals) do
-		sum += v
+	print("\n----- COMPARAÇÃO DIRETA DE INTERVALO MÉDIO -----")
+	local normalAvg = (#ABData["NORMAL"].intervals > 0) and getAverage(ABData["NORMAL"].intervals) or BASELINE_SECONDS
+	local bestFastAvg = math.huge
+
+	for _, modeName in ipairs(MODES_ORDER) do
+		local st = ABData[modeName]
+		if #st.intervals > 0 then
+			local avg = getAverage(st.intervals)
+			print(string.format("%-7s %.3fs (n=%d intervalos)", modeName .. ":", avg, #st.intervals))
+			if modeName ~= "NORMAL" and avg < bestFastAvg then
+				bestFastAvg = avg
+			end
+		else
+			print(string.format("%-7s ---", modeName .. ":"))
+		end
 	end
-	return sum / #State.Intervals
-end
 
-local function printFinalReport()
-	local totalTime = State.ElapsedTime
-	local totalOpenings = State.TotalOpenings
-	local opm = (totalTime > 0) and ((totalOpenings / totalTime) * 60) or 0
-	local avgInterval = getAverageInterval()
-	local minInt = (State.MinInterval == math.huge) and 0 or State.MinInterval
-	local maxInt = State.MaxInterval
-
-	print("\n===== STAR BATCH SPEED TEST (v2) =====")
-	print(string.format("Tempo total: %.2f segundos", totalTime))
-	print(string.format("Aberturas: %d", totalOpenings))
-	print(string.format("Aberturas/minuto: %.1f", opm))
-	print(string.format("Intervalo médio entre aberturas: %.3fs", avgInterval))
-	print(string.format("Menor intervalo: %.3fs", minInt))
-	print(string.format("Maior intervalo: %.3fs", maxInt))
-	print(string.format("Último intervalo: %.3fs", State.LastInterval))
-	print(string.format("Sinal Âncora usado: [%s] %s", tostring(State.AnchorType or "Nenhum"), tostring(State.AnchorPath or "Nenhum")))
-	print("\nPrimeiros 10 intervalos:")
-	if #State.Intervals == 0 then
-		print("  (Nenhum intervalo registrado)")
+	print("\nResultado Conclusivo:")
+	if bestFastAvg == math.huge then
+		print("  Teste pelo menos um modo acelerado (2x, 5x ou 10x) para comparar com o NORMAL.")
+	elseif (normalAvg - bestFastAvg) >= 0.08 and bestFastAvg < 0.95 then
+		print("  A animação/delay local INFLUENCIA a frequência real das aberturas.")
 	else
-		for i = 1, math.min(10, #State.Intervals) do
-			print(string.format("  #%d: %.3fs", i, State.Intervals[i]))
-		end
+		print("  Nenhuma alteração real significativa (~1.00s mantido). Provável cooldown independente da animação (ou controlado por Tween interno/Servidor).")
 	end
-	print("======================================\n")
+	print("========================================================================\n")
 end
 
 -- ============================================================================
--- INTERFACE GRÁFICA (GUI COMPACTA)
+-- INTERFACE GRÁFICA (PAINEL V3 COM SELETOR DE MULTIPLICADOR A/B)
 -- ============================================================================
 local function createUI()
 	local parentGui = PlayerGui
@@ -532,9 +597,9 @@ local function createUI()
 
 	local mainFrame = Instance.new("Frame")
 	mainFrame.Name = "MainFrame"
-	mainFrame.Size = UDim2.new(0, 310, 0, 325)
-	mainFrame.Position = UDim2.new(0.02, 0, 0.3, 0)
-	mainFrame.BackgroundColor3 = Color3.fromRGB(20, 22, 28)
+	mainFrame.Size = UDim2.new(0, 330, 0, 415)
+	mainFrame.Position = UDim2.new(0.02, 0, 0.25, 0)
+	mainFrame.BackgroundColor3 = Color3.fromRGB(18, 20, 26)
 	mainFrame.BorderSizePixel = 0
 	mainFrame.Parent = screenGui
 
@@ -543,13 +608,13 @@ local function createUI()
 	corner.Parent = mainFrame
 
 	local stroke = Instance.new("UIStroke")
-	stroke.Color = Color3.fromRGB(65, 70, 90)
+	stroke.Color = Color3.fromRGB(70, 80, 105)
 	stroke.Thickness = 1.5
 	stroke.Parent = mainFrame
 
 	local titleBar = Instance.new("Frame")
 	titleBar.Size = UDim2.new(1, 0, 0, 30)
-	titleBar.BackgroundColor3 = Color3.fromRGB(30, 34, 44)
+	titleBar.BackgroundColor3 = Color3.fromRGB(28, 32, 42)
 	titleBar.BorderSizePixel = 0
 	titleBar.Parent = mainFrame
 
@@ -562,8 +627,8 @@ local function createUI()
 	titleLabel.Position = UDim2.new(0, 10, 0, 0)
 	titleLabel.BackgroundTransparency = 1
 	titleLabel.Font = Enum.Font.GothamBold
-	titleLabel.Text = "STAR BATCH PROFILER v2"
-	titleLabel.TextColor3 = Color3.fromRGB(240, 240, 255)
+	titleLabel.Text = "STAR SPEED PROFILER v3 (A/B)"
+	titleLabel.TextColor3 = Color3.fromRGB(240, 245, 255)
 	titleLabel.TextSize = 13
 	titleLabel.TextXAlignment = Enum.TextXAlignment.Left
 	titleLabel.Parent = titleBar
@@ -580,15 +645,14 @@ local function createUI()
 
 	local statsLabel = Instance.new("TextLabel")
 	statsLabel.Position = UDim2.new(0, 12, 0, 36)
-	statsLabel.Size = UDim2.new(1, -24, 0, 195)
+	statsLabel.Size = UDim2.new(1, -24, 0, 255)
 	statsLabel.BackgroundTransparency = 1
 	statsLabel.Font = Enum.Font.RobotoMono
-	statsLabel.TextColor3 = Color3.fromRGB(220, 225, 235)
+	statsLabel.TextColor3 = Color3.fromRGB(225, 230, 240)
 	statsLabel.TextSize = 12
 	statsLabel.TextXAlignment = Enum.TextXAlignment.Left
 	statsLabel.TextYAlignment = Enum.TextYAlignment.Top
 	statsLabel.RichText = true
-	statsLabel.TextTruncate = Enum.TextTruncate.AtEnd
 	statsLabel.Parent = mainFrame
 
 	local function makeButton(text: string, pos: UDim2, size: UDim2, color: Color3): TextButton
@@ -599,7 +663,7 @@ local function createUI()
 		btn.Font = Enum.Font.GothamBold
 		btn.Text = text
 		btn.TextColor3 = Color3.fromRGB(255, 255, 255)
-		btn.TextSize = 12
+		btn.TextSize = 11
 		btn.AutoButtonColor = true
 		btn.Parent = mainFrame
 
@@ -609,12 +673,31 @@ local function createUI()
 		return btn
 	end
 
-	local startBtn = makeButton("[START]", UDim2.new(0, 10, 0, 240), UDim2.new(0, 92, 0, 32), Color3.fromRGB(40, 140, 75))
-	local stopBtn  = makeButton("[STOP]",  UDim2.new(0, 109, 0, 240), UDim2.new(0, 92, 0, 32), Color3.fromRGB(175, 55, 55))
-	local resetBtn = makeButton("[RESET]", UDim2.new(0, 208, 0, 240), UDim2.new(0, 92, 0, 32), Color3.fromRGB(70, 80, 100))
+	-- Seletores de Multiplicador A/B (1x, 2x, 5x, 10x)
+	local multButtons: {[number]: TextButton} = {}
+	local multOptions = {1, 2, 5, 10}
+	for i, mult in ipairs(multOptions) do
+		local xOffset = 10 + (i - 1) * 79
+		local label = (mult == 1) and "1x (NORM)" or (tostring(mult) .. "x")
+		local btn = makeButton(label, UDim2.new(0, xOffset, 0, 298), UDim2.new(0, 73, 0, 28), Color3.fromRGB(50, 58, 75))
+		multButtons[mult] = btn
 
-	local recalibBtn = makeButton("RECALIBRAR", UDim2.new(0, 10, 0, 280), UDim2.new(0, 140, 0, 30), Color3.fromRGB(55, 95, 160))
-	local debugBtn   = makeButton("DEBUG: ON",  UDim2.new(0, 160, 0, 280), UDim2.new(0, 140, 0, 30), Color3.fromRGB(110, 80, 150))
+		btn.MouseButton1Click:Connect(function()
+			SPEED_MULTIPLIER = mult
+			SPEED_TEST = (mult > 1)
+			-- Reseta o último timestamp ao trocar de modo para não misturar intervalo entre dois modos
+			State.LastPityTimestamp = nil
+			refreshAllPlayingTracks()
+			print(string.format("[STAR PROFILER v3] Modo alterado para: %s (SPEED_TEST = %s)", getCurrentModeName(), tostring(SPEED_TEST)))
+		end)
+	end
+
+	local startBtn = makeButton("[START]", UDim2.new(0, 10, 0, 334), UDim2.new(0, 100, 0, 32), Color3.fromRGB(40, 140, 75))
+	local stopBtn  = makeButton("[STOP]",  UDim2.new(0, 115, 0, 334), UDim2.new(0, 100, 0, 32), Color3.fromRGB(175, 55, 55))
+	local resetBtn = makeButton("[RESET]", UDim2.new(0, 220, 0, 334), UDim2.new(0, 100, 0, 32), Color3.fromRGB(70, 80, 100))
+
+	local speedToggleBtn = makeButton("SPEED TEST: ON", UDim2.new(0, 10, 0, 374), UDim2.new(0, 150, 0, 30), Color3.fromRGB(115, 75, 165))
+	local recalibBtn     = makeButton("RECALIBRAR / F9", UDim2.new(0, 170, 0, 374), UDim2.new(0, 150, 0, 30), Color3.fromRGB(55, 95, 160))
 
 	-- Dragging
 	local dragging, dragInput, dragStart, startPos
@@ -648,92 +731,104 @@ local function createUI()
 	startBtn.MouseButton1Click:Connect(function()
 		if State.IsRunning then return end
 		State.IsRunning = true
-		State.StartTime = os.clock() - State.ElapsedTime
-		print("[STAR PROFILER v2] Medição de ABERTURAS iniciada.")
+		State.LastTick = os.clock()
+		State.LastPityTimestamp = nil
+		refreshAllPlayingTracks()
+		print(string.format("[STAR PROFILER v3] Coleta INICIADA no modo %s.", getCurrentModeName()))
 	end)
 
 	stopBtn.MouseButton1Click:Connect(function()
-		if State.IsRunning then
-			State.ElapsedTime = os.clock() - State.StartTime
-			State.IsRunning = false
-		end
-		printFinalReport()
+		State.IsRunning = false
+		printABReport()
 	end)
 
 	resetBtn.MouseButton1Click:Connect(function()
 		State.IsRunning = false
-		State.StartTime = 0
-		State.ElapsedTime = 0
-		State.TotalOpenings = 0
-		State.LastOpeningTimestamp = nil
-		State.AnchorPath = nil
-		State.AnchorType = nil
-		State.AnchorPriority = 0
-		State.MinInterval = math.huge
-		State.MaxInterval = 0
-		State.LastInterval = 0
-		table.clear(State.Intervals)
-		table.clear(State.OpeningHistory)
-		print("[STAR PROFILER v2] Histórico e Sinal Âncora resetados.")
+		State.LastPityTimestamp = nil
+		local modeName = getCurrentModeName()
+		ABData[modeName] = createEmptyModeStats(modeName, SPEED_TEST and SPEED_MULTIPLIER or 1)
+		print(string.format("[STAR PROFILER v3] Dados do modo [%s] foram resetados.", modeName))
+	end)
+
+	speedToggleBtn.MouseButton1Click:Connect(function()
+		SPEED_TEST = not SPEED_TEST
+		State.LastPityTimestamp = nil
+		refreshAllPlayingTracks()
 	end)
 
 	recalibBtn.MouseButton1Click:Connect(function()
-		State.AnchorPath = nil
-		State.AnchorType = nil
-		State.AnchorPriority = 0
-		scanAndConnect()
-	end)
-
-	debugBtn.MouseButton1Click:Connect(function()
-		DEBUG = not DEBUG
-		debugBtn.Text = DEBUG and "DEBUG: ON" or "DEBUG: OFF"
-		debugBtn.BackgroundColor3 = DEBUG and Color3.fromRGB(110, 80, 150) or Color3.fromRGB(60, 60, 70)
+		scanAndConnectAll()
+		printABReport()
 	end)
 
 	local renderConn
 	renderConn = RunService.RenderStepped:Connect(function()
 		local now = os.clock()
+		local dt = now - State.LastTick
+		State.LastTick = now
+
+		local st = getCurrentModeStats()
 		if State.IsRunning then
-			State.ElapsedTime = now - State.StartTime
+			st.activeTime += dt
 		end
 
-		local elapsed = State.ElapsedTime
-		local opm = (elapsed > 0) and ((State.TotalOpenings / elapsed) * 60) or 0
-		local avgInt = getAverageInterval()
-		local minInt = (State.MinInterval == math.huge) and 0 or State.MinInterval
-		local maxInt = State.MaxInterval
-		local c10, c30, c60 = getRollingWindowCounts(now)
+		-- Destaque visual do botão do multiplicador ativo
+		for mult, btn in pairs(multButtons) do
+			local isActive = (SPEED_TEST and SPEED_MULTIPLIER == mult) or (not SPEED_TEST and mult == 1)
+			btn.BackgroundColor3 = isActive and Color3.fromRGB(45, 130, 210) or Color3.fromRGB(50, 58, 75)
+		end
+		speedToggleBtn.Text = SPEED_TEST and "SPEED TEST: ON" or "SPEED TEST: OFF"
+		speedToggleBtn.BackgroundColor3 = SPEED_TEST and Color3.fromRGB(115, 75, 165) or Color3.fromRGB(65, 65, 75)
+
+		local avgInt = getAverage(st.intervals)
+		local minInt = (st.minInterval == math.huge) and 0 or st.minInterval
+		local maxInt = st.maxInterval
+		local opm = (st.activeTime > 0) and ((st.openings / st.activeTime) * 60) or 0
+		local rpm = (st.activeTime > 0) and ((st.realRolls / st.activeTime) * 60) or 0
+		local improvement = getImprovementPercent(st)
+		local verdict = classifyModeResult(st)
+
+		-- Linha compacta de comparação A/B em tempo real
+		local normAvg = (#ABData["NORMAL"].intervals > 0) and string.format("%.3fs", getAverage(ABData["NORMAL"].intervals)) or "---"
+		local x2Avg   = (#ABData["2x"].intervals > 0)     and string.format("%.3fs", getAverage(ABData["2x"].intervals))     or "---"
+		local x5Avg   = (#ABData["5x"].intervals > 0)     and string.format("%.3fs", getAverage(ABData["5x"].intervals))     or "---"
+		local x10Avg  = (#ABData["10x"].intervals > 0)    and string.format("%.3fs", getAverage(ABData["10x"].intervals))    or "---"
 
 		statsLabel.Text = string.format(
-			"STATUS: %s | TEMPO: %.2fs\n" ..
-			"ABERTURAS: %d\n" ..
-			"ABERTURAS/MIN: %.1f\n" ..
-			"INTERVALO MÉDIO ENTRE ABERTURAS: %.3fs\n" ..
-			"MENOR INTERVALO: %.3fs\n" ..
-			"MAIOR INTERVALO: %.3fs\n" ..
-			"ÚLTIMO INTERVALO: %.3fs\n" ..
-			"10s | 30s | 60s: %d | %d | %d\n" ..
-			"ÂNCORA: %s",
+			"STATUS: %s | MODO: <b>%s</b>\n" ..
+			"SPEED TEST: %s | MULTIPLIER: %dx\n\n" ..
+			"ABERTURAS: %d  (%.1f/min)\n" ..
+			"ROLLS REAIS: %d  (%.1f/min)\n\n" ..
+			"INTERVALO ATUAL: %.3fs\n" ..
+			"INTERVALO MÉDIO: %.3fs\n" ..
+			"MENOR / MAIOR: %.3fs / %.3fs\n\n" ..
+			"BASELINE: %.3fs | MELHORA: %+.1f%%\n" ..
+			"RESULTADO:\n<b>%s</b>\n\n" ..
+			"A/B: N:%s | 2x:%s | 5x:%s | 10x:%s",
 			State.IsRunning and '<font color="#55ff7f">RODANDO</font>' or '<font color="#ffaa55">PARADO</font>',
-			elapsed,
-			State.TotalOpenings,
-			opm,
+			st.name,
+			SPEED_TEST and "ON" or "OFF",
+			getEffectiveSpeed(),
+			st.openings, opm,
+			st.realRolls, rpm,
+			st.lastInterval,
 			avgInt,
-			minInt,
-			maxInt,
-			State.LastInterval,
-			c10, c30, c60,
-			State.AnchorType and (State.AnchorType .. " (Travado)") or "Aguardando 1º giro..."
+			minInt, maxInt,
+			BASELINE_SECONDS, improvement,
+			verdict,
+			normAvg, x2Avg, x5Avg, x10Avg
 		)
 	end)
 
 	closeBtn.MouseButton1Click:Connect(function()
 		State.IsRunning = false
+		SPEED_TEST = false
+		refreshAllPlayingTracks()
 		if renderConn then renderConn:Disconnect() end
 		if dragConn then dragConn:Disconnect() end
-		clearWatchers()
+		clearConnections()
 		screenGui:Destroy()
-		print("[STAR PROFILER v2] Encerrado.")
+		print("[STAR PROFILER v3] Encerrado e conexões limpas.")
 	end)
 end
 
@@ -741,4 +836,4 @@ end
 -- INICIALIZAÇÃO
 -- ============================================================================
 createUI()
-scanAndConnect()
+scanAndConnectAll()

@@ -1,17 +1,13 @@
 --[[
-    STAR TIMING DIAGNOSTIC v5 (MULTI-LAYER INPUT & LOCAL GATING INSPECTOR)
+    ANIME LEGACY CLIENT / GACHA INSPECTOR (100% READ-ONLY)
     Jogo alvo: Anime Legacy Simulator
-    Modo: 100% Read-Only (Sem FireServer, sem InvokeServer, sem hooks de metamétodos, sem alterar valores)
-    Objetivo:
-      1. Verificar se todos os cliques físicos no MAX realmente chegam ao GuiButton ou se são bloqueados na UI.
-      2. Detectar se o botão MAX é recriado (nova Instance), ocultado ou desativado durante o giro.
-      3. Identificar possíveis Flags/Estados locais (Gating) na janela de 1.5s após cada clique.
+    Objetivo: Mapear Scripts, Modules, Remotes, States, Árvores de UI (Star, Rolling, StarAnimation),
+              Dependências Visíveis, Roll Trace de 3.0s e Diff A/B de Snapshots.
 ]]
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
-local GuiService = game:GetService("GuiService")
 local CoreGui = game:GetService("CoreGui")
 local Workspace = game:GetService("Workspace")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -21,154 +17,79 @@ local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 local PlayerScripts = LocalPlayer:FindFirstChild("PlayerScripts")
 
 -- ============================================================================
--- CONFIGURAÇÕES PRINCIPAIS
+-- CONFIGURAÇÕES E PALAVRAS-CHAVE
 -- ============================================================================
-local DEBUG = true
+local CAPTURE_DURATION = 3.000 -- Duração da captura [CAPTURE ROLL] em segundos
+local INSPECTOR_GUI_NAME = "AnimeLegacyGachaInspectorUI"
 
--- Janela (em segundos) para agrupar MouseButton1Down + MouseButton1Up + Activated
--- como um único clique físico processado pelo botão
-local PHYSICAL_CLICK_GROUP_WINDOW = 0.18
+local SCRIPT_KEYWORDS = {
+	"star", "gacha", "roll", "rolling", "summon", "open",
+	"auto", "fighter", "unit", "character", "capsule", "banner", "pity"
+}
 
--- Janela (em segundos) após um clique em MAX para observar mudanças de estado/flags (Gating)
-local POST_CLICK_GATE_WINDOW = 1.50
+local REMOTE_KEYWORDS = {
+	"star", "gacha", "roll", "rolling", "summon", "open",
+	"buy", "purchase", "fighter", "unit", "character", "auto"
+}
 
--- Evita leituras duplicadas se o texto do Pity atualizar duas vezes no mesmo frame
-local PITY_DEDUP_WINDOW = 0.06
-
-local DEFAULT_MAX_DELTA = 9
-
-local GATE_KEYWORDS = {
-	"opening", "isopening", "open", "canopen", "busy", "ready",
-	"cooldown", "debounce", "rolling", "isrolling", "summoning", "auto", "star"
+local STATE_KEYWORDS = {
+	"opening", "isopening", "rolling", "isrolling", "busy", "ready",
+	"canopen", "cooldown", "debounce", "auto", "star", "summon", "gacha", "pity"
 }
 
 local IGNORE_KEYWORDS = {
-	"timer", "fps", "ping", "clock", "timeleft", "refresh",
-	"chat", "bubble", "health", "xp", "quest", "index", "music", "sound"
+	"chat", "bubble", "freecam", "leaderboard", "playerlist", "backpack",
+	"touchgui", "topbar", "PurchasePrompt", INSPECTOR_GUI_NAME
 }
 
 -- ============================================================================
--- RASTREADOR DE IDENTIDADE DE INSTÂNCIAS (UID)
--- Permite saber se um objeto com o mesmo Path é uma nova Instance recriada
+-- IDENTIFICAÇÃO ÚNICA DE INSTÂNCIAS (UID) E CAMINHOS LIMPOS
 -- ============================================================================
-local InstanceUIDMap = setmetatable({}, { __mode = "k" }) :: {[Instance]: number}
-local NextInstanceUID = 0
+local InstanceUIDs = setmetatable({}, { __mode = "k" }) :: {[Instance]: number}
+local NextUID = 0
 
-local function getInstanceUID(inst: Instance): string
-	local uid = InstanceUIDMap[inst]
-	if not uid then
-		NextInstanceUID += 1
-		uid = NextInstanceUID
-		InstanceUIDMap[inst] = uid
+local function getUID(inst: Instance): string
+	local id = InstanceUIDs[inst]
+	if not id then
+		NextUID += 1
+		id = NextUID
+		InstanceUIDs[inst] = id
 	end
-	return "#" .. tostring(uid)
+	return "#" .. tostring(id)
 end
 
--- ============================================================================
--- ESTADO GLOBAL E MÉTRICAS DA V5
--- ============================================================================
-export type CycleFlagLog = {
-	path: string,
-	oldVal: string,
-	newVal: string,
-	timestamp: number,
-}
-
-export type GateCandidateStats = {
-	path: string,
-	activationsAfterClick: number,
-	releasesBeforeNext: number,
-	lastActivatedTime: number?,
-	lastReleaseTime: number?,
-	lastHoldDuration: number,
-	activeValue: any,
-}
-
-local State = {
-	IsRunning = false,
-
-	-- Contadores diferenciados (Item 5)
-	RawMouseClicks = 0,          -- Cliques globais do mouse (qualquer lugar)
-	PhysicalMaxClicks = 0,       -- Cliques físicos confirmados sobre a área/botão MAX
-	ButtonEventsCount = 0,       -- Total bruto de eventos (Down + Up + Activated) disparados pelo botão
-	GroupedButtonMaxClicks = 0,  -- Cliques físicos nos quais o botão MAX realmente respondeu com evento
-	ButtonActivatedCount = 0,    -- Quantas vezes especificamente o evento .Activated disparou no MAX
-
-	-- Contadores oficiais (via Pity - Item 6)
-	RealOpenings = 0,
-	RealRolls = 0,
-
-	-- Timestamps e Intervalos
-	LastPhysicalMaxClickTime = nil :: number?,
-	LastGroupedBtnEventTime = nil :: number?,
-	LastPityTime = nil :: number?,
-	MinClickToClick = math.huge,
-	MinPityToPity = math.huge,
-	LastClickToPity = 0,
-	LastPityToPity = 0,
-
-	ClickIntervals = {} :: {number},
-	ButtonClickIntervals = {} :: {number},
-	PityIntervals = {} :: {number},
-
-	-- Dados acumulados no Ciclo Atual (para o relatório CYCLE #N no F9)
-	CycleRawMaxClicks = {} :: {number},
-	CycleButtonActivated = {} :: {number},
-	CycleButtonEvents = {} :: {string},
-	CycleFlags = {} :: {CycleFlagLog},
-
-	-- Pity
-	LastPityValue = nil :: number?,
-	LastPityMax = nil :: number?,
-	PityPath = "Procurando...",
-
-	-- Rastreamento de Botões e Caixas Geométricas (para detectar cliques mesmo se oculto/coberto)
-	CurrentMaxButton = nil :: GuiObject?,
-	CurrentMaxButtonUID = nil :: string?,
-	CurrentMaxButtonPath = "Não encontrado",
-	LastKnownMaxAbsPos = nil :: Vector2?,
-	LastKnownMaxAbsSize = nil :: Vector2?,
-	MaxButtonReplacements = 0,
-	BlockedOverlayClicks = 0,
-
-	-- Gating Local (Item 4)
-	GateCandidates = {} :: {[string]: GateCandidateStats},
-	BestGateCandidate = "NENHUM",
-}
-
-local Connections = {} :: {RBXScriptConnection}
-local WatchedInstances = setmetatable({}, { __mode = "k" }) :: {[Instance]: boolean}
-
--- ============================================================================
--- FUNÇÕES UTILITÁRIAS
--- ============================================================================
 local function getCleanPath(inst: Instance): string
 	local parts = {}
-	local current: Instance? = inst
-	while current and current ~= game and current ~= LocalPlayer do
-		table.insert(parts, 1, current.Name)
-		current = current.Parent
+	local curr: Instance? = inst
+	while curr and curr ~= game do
+		if curr == LocalPlayer then
+			table.insert(parts, 1, "LocalPlayer")
+			break
+		end
+		table.insert(parts, 1, curr.Name)
+		curr = curr.Parent
 	end
 	return table.concat(parts, ".")
 end
 
-local function containsKeyword(str: string, list: {string}): boolean
-	local lower = string.lower(str)
-	for _, w in ipairs(list) do
-		if string.find(lower, w, 1, true) then
-			return true
-		end
-	end
-	return false
+local function isInspectorObject(inst: Instance): boolean
+	local p = getCleanPath(inst)
+	return string.find(p, INSPECTOR_GUI_NAME, 1, true) ~= nil
 end
 
-local function getAverage(list: {number}): number
-	if #list == 0 then return 0 end
-	local s = 0
-	for _, v in ipairs(list) do
-		s += v
+local function matchesKeywords(text: string, keywords: {string}): (boolean, string?)
+	local lower = string.lower(text)
+	for _, kw in ipairs(keywords) do
+		if string.find(lower, kw, 1, true) then
+			return true, kw
+		end
 	end
-	return s / #list
+	return false, nil
+end
+
+local function isIgnoredPath(path: string): boolean
+	local matched, _ = matchesKeywords(path, IGNORE_KEYWORDS)
+	return matched
 end
 
 local function parsePityNumbers(text: string): (number?, number?)
@@ -183,811 +104,1013 @@ local function parsePityNumbers(text: string): (number?, number?)
 	return nil, nil
 end
 
--- Identifica se uma instância pertence à hierarquia de MAX, SINGLE ou AUTO
-local function classifyStarButtonHierarchy(inst: Instance): string?
-	local curr: Instance? = inst
-	while curr and curr ~= PlayerGui and curr.Name ~= "Star" and curr.Name ~= "Frames" do
-		local n = string.lower(curr.Name)
-		if n == "max" or string.find(n, "max", 1, true) or string.find(n, "multi", 1, true) then
-			return "MAX"
-		elseif n == "single" or string.find(n, "single", 1, true) or n == "1x" or n == "one" then
-			return "SINGLE"
-		elseif n == "auto" or string.find(n, "auto", 1, true) then
-			return "AUTO"
-		end
-		curr = curr.Parent
-	end
-
-	-- Fallback pelo texto interno caso o botão tenha nome genérico
-	if inst:IsA("GuiObject") then
-		for _, desc in ipairs(inst:GetDescendants()) do
-			if desc:IsA("TextLabel") and desc.Text ~= "" then
-				local t = string.lower(desc.Text)
-				if string.find(t, "max", 1, true) then return "MAX" end
-				if string.find(t, "single", 1, true) then return "SINGLE" end
-				if string.find(t, "auto", 1, true) then return "AUTO" end
-			end
-		end
-	end
-	return nil
-end
-
 -- ============================================================================
--- 4. MOTOR DE DETECÇÃO DE GATING LOCAL (JANELA DE 1.5s PÓS-CLIQUE)
+-- SISTEMA DE PONTUAÇÃO DE EVIDÊNCIAS (TOP CANDIDATES)
 -- ============================================================================
-local function updateBestGateCandidate()
-	local bestPath = "NENHUM"
-	local bestScore = 0
+export type CandidateRecord = {
+	path: string,
+	className: string,
+	name: string,
+	score: number,
+	reasons: {[string]: boolean},
+	changeCount: number,
+}
 
-	for path, info in pairs(State.GateCandidates) do
-		-- Pontua candidatos que ativam logo após o clique e liberam próximo de ~1s
-		local score = math.min(info.activationsAfterClick, info.releasesBeforeNext)
-		if score >= 2 and score > bestScore then
-			bestScore = score
-			bestPath = string.format("%s (%.2fs | %dx)", path, info.lastHoldDuration, score)
-		end
-	end
+local CandidateRegistry: {[string]: CandidateRecord} = {}
 
-	State.BestGateCandidate = bestPath
-end
+local function registerCandidateEvidence(instOrPath: Instance | string, className: string, name: string, reason: string, points: number, isRuntimeChange: boolean?)
+	local path = (typeof(instOrPath) == "Instance") and getCleanPath(instOrPath) or (instOrPath :: string)
+	if isIgnoredPath(path) then return end
 
-local function recordStateTransition(path: string, oldVal: any, newVal: any)
-	local now = os.clock()
-	local oldStr = tostring(oldVal)
-	local newStr = tostring(newVal)
-
-	-- Registra na timeline do ciclo atual se ocorreu perto de um clique ou durante uma abertura
-	local timeSinceMaxClick = State.LastPhysicalMaxClickTime and (now - State.LastPhysicalMaxClickTime) or math.huge
-	local timeSincePity = State.LastPityTime and (now - State.LastPityTime) or math.huge
-
-	if timeSinceMaxClick <= POST_CLICK_GATE_WINDOW or timeSincePity <= POST_CLICK_GATE_WINDOW then
-		table.insert(State.CycleFlags, {
+	local rec = CandidateRegistry[path]
+	if not rec then
+		rec = {
 			path = path,
-			oldVal = oldStr,
-			newVal = newStr,
-			timestamp = now,
+			className = className,
+			name = name,
+			score = 0,
+			reasons = {},
+			changeCount = 0,
+		}
+		CandidateRegistry[path] = rec
+	end
+
+	if not rec.reasons[reason] then
+		rec.reasons[reason] = true
+		rec.score += points
+	end
+
+	if isRuntimeChange then
+		rec.changeCount += 1
+		rec.score += 1
+	end
+end
+
+-- ============================================================================
+-- ESTRUTURAS DE DADOS DO INVENTÁRIO
+-- ============================================================================
+local Inventory = {
+	Scripts = {} :: {any},
+	Modules = {} :: {any},
+	ScriptCandidates = {} :: {any},
+	Dependencies = {} :: {any},
+	Remotes = {} :: {any},
+	States = {} :: {any},
+	AnimationObjects = {} :: {any},
+	LastRollTrace = {} :: {string},
+	LastDiffReport = {} :: {string},
+	IsCapturingRoll = false,
+	SnapshotA = nil :: any,
+	SnapshotB = nil :: any,
+}
+
+local Connections = {} :: {RBXScriptConnection}
+local TraceConnections = {} :: {RBXScriptConnection}
+
+-- ============================================================================
+-- 1 & 6. INVENTÁRIO DE SCRIPTS, MODULES E DEPENDÊNCIAS VISÍVEIS
+-- ============================================================================
+local function tryReadSourceStatus(scr: Instance): string
+	local ok, src = pcall(function()
+		return (scr :: any).Source
+	end)
+	if ok and type(src) == "string" and #src > 0 then
+		return string.format("ACCESSIBLE (%d chars)", #src)
+	end
+	return "SOURCE NOT ACCESSIBLE"
+end
+
+local function getScriptEnabledStatus(scr: Instance): string
+	if scr:IsA("ModuleScript") then
+		return "N/A (ModuleScript)"
+	end
+	local ok, val = pcall(function()
+		return (scr :: any).Enabled
+	end)
+	if ok then
+		return tostring(val)
+	end
+	local okDis, disVal = pcall(function()
+		return not (scr :: any).Disabled
+	end)
+	if okDis then
+		return tostring(disVal)
+	end
+	return "NOT OBSERVABLE WITH CURRENT ACCESS"
+end
+
+local function inspectVisibleDependencies(inst: Instance, instPath: string)
+	local deps = {}
+
+	-- 1. Atributos no próprio Script/Module
+	local attrs = inst:GetAttributes()
+	for k, v in pairs(attrs) do
+		table.insert(deps, string.format("Attribute '%s' = %s (%s)", k, tostring(v), typeof(v)))
+	end
+
+	-- 2. Filhos diretos e descendentes imediatos (ObjectValues, Values, Modules, Remotes, Binds)
+	for _, desc in ipairs(inst:GetDescendants()) do
+		if desc:IsA("ObjectValue") then
+			local targetPath = desc.Value and getCleanPath(desc.Value) or "nil"
+			table.insert(deps, string.format("ObjectValue '%s' -> %s", getCleanPath(desc), targetPath))
+		elseif desc:IsA("ValueBase") then
+			local v = (desc :: any).Value
+			table.insert(deps, string.format("%s '%s' = %s", desc.ClassName, desc.Name, tostring(v)))
+		elseif desc:IsA("RemoteEvent") or desc:IsA("RemoteFunction") or desc:IsA("BindableEvent") or desc:IsA("BindableFunction") then
+			table.insert(deps, string.format("Child Remote/Bindable: %s (%s)", getCleanPath(desc), desc.ClassName))
+		elseif desc:IsA("ModuleScript") and desc ~= inst then
+			table.insert(deps, string.format("Child ModuleScript: %s", getCleanPath(desc)))
+		end
+	end
+
+	-- 3. Contexto de Parent se estiver acoplado dentro de um Botão ou Frame da UI
+	if inst.Parent and (inst.Parent:IsA("GuiObject") or inst.Parent:IsA("ScreenGui")) then
+		table.insert(deps, string.format("Attached UI Parent: %s (%s)", getCleanPath(inst.Parent), inst.Parent.ClassName))
+	end
+
+	if #deps > 0 then
+		table.insert(Inventory.Dependencies, {
+			ownerPath = instPath,
+			ownerClass = inst.ClassName,
+			items = deps,
 		})
 	end
+end
 
-	-- Análise de correlação de Gating
-	local cand = State.GateCandidates[path]
-	if not cand then
-		cand = {
-			path = path,
-			activationsAfterClick = 0,
-			releasesBeforeNext = 0,
-			lastActivatedTime = nil,
-			lastReleaseTime = nil,
-			lastHoldDuration = 0,
-			activeValue = nil,
-		}
-		State.GateCandidates[path] = cand
+local function scanScriptsAndModules()
+	table.clear(Inventory.Scripts)
+	table.clear(Inventory.Modules)
+	table.clear(Inventory.ScriptCandidates)
+	table.clear(Inventory.Dependencies)
+
+	local roots = { PlayerGui, ReplicatedStorage }
+	if PlayerScripts then
+		table.insert(roots, 1, PlayerScripts)
 	end
 
-	-- Se a mudança ocorreu logo após um clique físico em MAX (ex: até 0.25s depois do clique)
-	if timeSinceMaxClick <= 0.25 then
-		cand.activationsAfterClick += 1
-		cand.lastActivatedTime = now
-		cand.activeValue = newVal
-	elseif cand.lastActivatedTime and newVal ~= cand.activeValue then
-		-- O estado voltou ao normal antes/perto da próxima abertura!
-		local holdTime = now - cand.lastActivatedTime
-		if holdTime >= 0.30 and holdTime <= 1.60 then
-			cand.releasesBeforeNext += 1
-			cand.lastReleaseTime = now
-			cand.lastHoldDuration = holdTime
-			updateBestGateCandidate()
+	for _, root in ipairs(roots) do
+		for _, desc in ipairs(root:GetDescendants()) do
+			if not isInspectorObject(desc) and (desc:IsA("LocalScript") or desc:IsA("ModuleScript") or desc:IsA("Script")) then
+				local path = getCleanPath(desc)
+				if not isIgnoredPath(path) then
+					local enabledStr = getScriptEnabledStatus(desc)
+					local sourceStr = tryReadSourceStatus(desc)
+					local isCandidate, matchedKw = matchesKeywords(path, SCRIPT_KEYWORDS)
 
-			if DEBUG then
-				print(string.format(
-					"[GATE CANDIDATE MATCH] %s\n  Retornou para %s após %.3fs (Ativações: %d | Liberações: %d)",
-					path, newStr, holdTime, cand.activationsAfterClick, cand.releasesBeforeNext
-				))
+					local entry = {
+						className = desc.ClassName,
+						path = path,
+						name = desc.Name,
+						enabled = enabledStr,
+						sourceStatus = sourceStr,
+						isCandidate = isCandidate,
+						matchedKeyword = matchedKw,
+						uid = getUID(desc),
+					}
+
+					if desc:IsA("ModuleScript") then
+						table.insert(Inventory.Modules, entry)
+					else
+						table.insert(Inventory.Scripts, entry)
+					end
+
+					if isCandidate then
+						table.insert(Inventory.ScriptCandidates, entry)
+						registerCandidateEvidence(desc, desc.ClassName, desc.Name, "Keyword Match (" .. tostring(matchedKw) .. ")", 2, false)
+					end
+
+					inspectVisibleDependencies(desc, path)
+				end
 			end
 		end
-		cand.lastActivatedTime = nil
-	end
-
-	if DEBUG and (timeSinceMaxClick <= POST_CLICK_GATE_WINDOW) then
-		print(string.format(
-			"[LOCAL STATE CHANGE] T = %.3f (+%.3fs após MAX click)\n  Path: %s\n  %s -> %s",
-			now, timeSinceMaxClick, path, oldStr, newStr
-		))
 	end
 end
 
 -- ============================================================================
--- 1 & 3. MONITORAMENTO DE BOTÕES E SUBSTITUIÇÃO DE INSTANCE
+-- 2. INVENTÁRIO DE REMOTES
 -- ============================================================================
-local function watchButtonProperties(guiObj: GuiObject, path: string, kind: string)
-	local propKey = "props_" .. getInstanceUID(guiObj)
-	if WatchedInstances[propKey :: any] then return end
-	WatchedInstances[propKey :: any] = true
+local function scanRemotes()
+	table.clear(Inventory.Remotes)
+	local roots = { ReplicatedStorage, PlayerGui, Workspace, LocalPlayer }
 
-	local function logMaxState(propName: string, oldV: any, newV: any)
-		local now = os.clock()
-		if DEBUG then
-			print(string.format(
-				"[%s BUTTON STATE] Propriedade '%s' mudou\n  Path: %s [%s]\n  Old: %s -> New: %s\n  T = %.3f",
-				kind, propName, path, getInstanceUID(guiObj), tostring(oldV), tostring(newV), now
-			))
-		end
-		recordStateTransition(path .. "." .. propName, oldV, newV)
-	end
-
-	-- Monitora Visible, Active, Selectable, AutoButtonColor e Interactable
-	local lastVis = guiObj.Visible
-	table.insert(Connections, guiObj:GetPropertyChangedSignal("Visible"):Connect(function()
-		local v = guiObj.Visible
-		logMaxState("Visible", lastVis, v)
-		lastVis = v
-	end))
-
-	local lastAct = guiObj.Active
-	table.insert(Connections, guiObj:GetPropertyChangedSignal("Active"):Connect(function()
-		local v = guiObj.Active
-		logMaxState("Active", lastAct, v)
-		lastAct = v
-	end))
-
-	local lastSel = guiObj.Selectable
-	table.insert(Connections, guiObj:GetPropertyChangedSignal("Selectable"):Connect(function()
-		local v = guiObj.Selectable
-		logMaxState("Selectable", lastSel, v)
-		lastSel = v
-	end))
-
-	-- Interactable (protegido por pcall para máxima compatibilidade)
-	pcall(function()
-		local lastInt = (guiObj :: any).Interactable
-		table.insert(Connections, guiObj:GetPropertyChangedSignal("Interactable"):Connect(function()
-			local v = (guiObj :: any).Interactable
-			logMaxState("Interactable", lastInt, v)
-			lastInt = v
-		end))
-	end)
-
-	if guiObj:IsA("GuiButton") then
-		local lastAbc = guiObj.AutoButtonColor
-		table.insert(Connections, guiObj:GetPropertyChangedSignal("AutoButtonColor"):Connect(function()
-			local v = guiObj.AutoButtonColor
-			logMaxState("AutoButtonColor", lastAbc, v)
-			lastAbc = v
-		end))
-	end
-
-	-- Monitora remoção / troca de Parent
-	table.insert(Connections, guiObj.AncestryChanged:Connect(function(_, newParent)
-		if not newParent or not guiObj:IsDescendantOf(PlayerGui) then
-			if DEBUG then
-				print(string.format(
-					"[%s BUTTON STATE] Botão removido da árvore!\n  Path antigo: %s [%s]\n  Novo Parent: %s\n  T = %.3f",
-					kind, path, getInstanceUID(guiObj), tostring(newParent), os.clock()
-				))
+	for _, root in ipairs(roots) do
+		for _, desc in ipairs(root:GetDescendants()) do
+			if not isInspectorObject(desc) and (
+				desc:IsA("RemoteEvent")
+				or desc:IsA("RemoteFunction")
+				or desc:IsA("UnreliableRemoteEvent")
+				or desc:IsA("BindableEvent")
+				or desc:IsA("BindableFunction")
+			) then
+				local path = getCleanPath(desc)
+				if not isIgnoredPath(path) then
+					local isCand, kw = matchesKeywords(path, REMOTE_KEYWORDS)
+					table.insert(Inventory.Remotes, {
+						className = desc.ClassName,
+						path = path,
+						name = desc.Name,
+						isCandidate = isCand,
+						matchedKeyword = kw,
+						uid = getUID(desc),
+					})
+					if isCand then
+						registerCandidateEvidence(desc, desc.ClassName, desc.Name, "Remote Keyword (" .. tostring(kw) .. ")", 2, false)
+					end
+				end
 			end
 		end
-	end))
+	end
 end
 
-local function hookGuiButtonEvents(btn: GuiButton, kind: string)
-	if WatchedInstances[btn] then return end
-	WatchedInstances[btn] = true
+-- ============================================================================
+-- 3. INVENTÁRIO DE STATES (VALUES & ATTRIBUTES) E OBJETOS DE ANIMAÇÃO
+-- ============================================================================
+local function scanStatesAndAnimations()
+	table.clear(Inventory.States)
+	table.clear(Inventory.AnimationObjects)
 
-	local path = getCleanPath(btn)
-	local uid = getInstanceUID(btn)
+	local roots = { LocalPlayer, PlayerGui, ReplicatedStorage, Workspace }
 
-	-- Detecta se o botão MAX principal foi substituído por uma nova Instance
-	if kind == "MAX" then
-		if State.CurrentMaxButton and State.CurrentMaxButton ~= btn then
-			State.MaxButtonReplacements += 1
-			if DEBUG then
-				print(string.format(
-					"\n[MAX BUTTON STATE]\nInstance mudou!\nOld: %s [%s]\nNew: %s [%s]\nT = %.3f\n",
-					State.CurrentMaxButtonPath,
-					tostring(State.CurrentMaxButtonUID),
-					path,
-					uid,
-					os.clock()
-				))
+	local function checkInstanceAttributes(inst: Instance)
+		local path = getCleanPath(inst)
+		if isIgnoredPath(path) then return end
+		local attrs = inst:GetAttributes()
+		for attrName, attrVal in pairs(attrs) do
+			local fullAttrPath = path .. ".Attribute." .. attrName
+			local isCand, kw = matchesKeywords(fullAttrPath, STATE_KEYWORDS)
+			if isCand or inst == LocalPlayer then
+				table.insert(Inventory.States, {
+					kind = "Attribute (" .. typeof(attrVal) .. ")",
+					path = fullAttrPath,
+					name = attrName,
+					value = tostring(attrVal),
+					isCandidate = isCand,
+				})
+				if isCand then
+					registerCandidateEvidence(fullAttrPath, "Attribute", attrName, "State Keyword (" .. tostring(kw) .. ")", 2, false)
+				end
 			end
-		end
-		State.CurrentMaxButton = btn
-		State.CurrentMaxButtonUID = uid
-		State.CurrentMaxButtonPath = path
-		if btn.AbsoluteSize.X > 0 and btn.AbsoluteSize.Y > 0 then
-			State.LastKnownMaxAbsPos = btn.AbsolutePosition
-			State.LastKnownMaxAbsSize = btn.AbsoluteSize
 		end
 	end
 
-	if DEBUG then
-		print(string.format("[BUTTON HOOKED] %s -> %s [%s]", kind, path, uid))
-	end
+	checkInstanceAttributes(LocalPlayer)
 
-	watchButtonProperties(btn, path, kind)
-
-	-- Camada A: Eventos individuais do próprio botão (MouseButton1Down, MouseButton1Up, Activated)
-	local function onRawButtonEvent(eventName: string)
-		local now = os.clock()
-
-		-- Atualiza caixa geométrica conhecida do MAX
-		if kind == "MAX" and btn.AbsoluteSize.X > 0 then
-			State.LastKnownMaxAbsPos = btn.AbsolutePosition
-			State.LastKnownMaxAbsSize = btn.AbsoluteSize
-		end
-
-		if State.IsRunning and kind == "MAX" then
-			State.ButtonEventsCount += 1
-			if eventName == "Activated" then
-				State.ButtonActivatedCount += 1
-				table.insert(State.CycleButtonActivated, now)
-			end
-			table.insert(State.CycleButtonEvents, string.format("%s @ %.3f", eventName, now))
-		end
-
-		if DEBUG then
-			print(string.format("[BUTTON EVENT]\n%s (%s [%s])\n%s\nT=%.3f", kind, path, uid, eventName, now))
-		end
-
-		-- Agrupamento em Clique Físico Processado pelo Botão (PHYSICAL_CLICK_GROUP_WINDOW = 0.18s)
-		if kind == "MAX" and (eventName == "MouseButton1Down" or eventName == "Activated") then
-			local lastGrp = State.LastGroupedBtnEventTime
-			if not lastGrp or (now - lastGrp) > PHYSICAL_CLICK_GROUP_WINDOW then
-				if lastGrp and State.IsRunning then
-					table.insert(State.ButtonClickIntervals, now - lastGrp)
-				end
-				State.LastGroupedBtnEventTime = now
-				if State.IsRunning then
-					State.GroupedButtonMaxClicks += 1
-				end
-
-				-- Caso o clique não tenha sido pego antes pelo InputBegan, garante registro como PhysicalMaxClick
-				if not State.LastPhysicalMaxClickTime or (now - State.LastPhysicalMaxClickTime) > PHYSICAL_CLICK_GROUP_WINDOW then
-					if State.LastPhysicalMaxClickTime and State.IsRunning then
-						local cDelta = now - State.LastPhysicalMaxClickTime
-						table.insert(State.ClickIntervals, cDelta)
-						if cDelta < State.MinClickToClick then
-							State.MinClickToClick = cDelta
+	for _, root in ipairs(roots) do
+		for _, desc in ipairs(root:GetDescendants()) do
+			if not isInspectorObject(desc) then
+				local path = getCleanPath(desc)
+				if not isIgnoredPath(path) then
+					-- Values
+					if desc:IsA("BoolValue") or desc:IsA("NumberValue") or desc:IsA("IntValue") or desc:IsA("StringValue") or desc:IsA("ObjectValue") then
+						local isCand, kw = matchesKeywords(path, STATE_KEYWORDS)
+						if isCand or root == LocalPlayer then
+							local valStr = tostring((desc :: any).Value)
+							table.insert(Inventory.States, {
+								kind = desc.ClassName,
+								path = path,
+								name = desc.Name,
+								value = valStr,
+								isCandidate = isCand,
+							})
+							if isCand then
+								registerCandidateEvidence(desc, desc.ClassName, desc.Name, "State Keyword (" .. tostring(kw) .. ")", 2, false)
+							end
 						end
 					end
-					State.LastPhysicalMaxClickTime = now
-					if State.IsRunning then
-						State.PhysicalMaxClicks += 1
-						table.insert(State.CycleRawMaxClicks, now)
+
+					-- Pity TextLabel conhecido
+					if path == "PlayerGui.UI.Frames.Star.Pity.Value" and desc:IsA("TextLabel") then
+						table.insert(Inventory.States, {
+							kind = "TextLabel (Pity Source)",
+							path = path,
+							name = desc.Name,
+							value = desc.Text,
+							isCandidate = true,
+						})
+						registerCandidateEvidence(desc, desc.ClassName, desc.Name, "Confirmed Pity Truth Source", 10, false)
+					end
+
+					-- Attributes em objetos relevantes
+					if next(desc:GetAttributes()) ~= nil then
+						checkInstanceAttributes(desc)
+					end
+
+					-- Animation Objects
+					if desc:IsA("Animation") or desc:IsA("Animator") or desc:IsA("AnimationController") or desc:IsA("ViewportFrame") then
+						local isAnimCand, _ = matchesKeywords(path, SCRIPT_KEYWORDS)
+						if isAnimCand or desc:IsDescendantOf(PlayerGui) or string.find(path, "Cache", 1, true) then
+							local extra = ""
+							if desc:IsA("Animation") then
+								extra = " | AnimationId: " .. tostring(desc.AnimationId)
+							end
+							table.insert(Inventory.AnimationObjects, {
+								className = desc.ClassName,
+								path = path,
+								name = desc.Name,
+								extra = extra,
+								uid = getUID(desc),
+							})
+							if isAnimCand then
+								registerCandidateEvidence(desc, desc.ClassName, desc.Name, "Animation/Viewport Object", 2, false)
+							end
+						end
 					end
 				end
 			end
 		end
 	end
-
-	table.insert(Connections, btn.MouseButton1Down:Connect(function()
-		onRawButtonEvent("MouseButton1Down")
-	end))
-	table.insert(Connections, btn.MouseButton1Up:Connect(function()
-		onRawButtonEvent("MouseButton1Up")
-	end))
-	table.insert(Connections, btn.Activated:Connect(function()
-		onRawButtonEvent("Activated")
-	end))
 end
 
 -- ============================================================================
--- 2. CAPTURA GLOBAL DO MOUSE (UserInputService + GetGuiObjectsAtPosition)
+-- 5. MAPA DA UI (DUMP HIERÁRQUICO COMPLETO)
 -- ============================================================================
-local function isPointInsideLastMaxRect(screenPos: Vector2, inset: Vector2): boolean
-	if not State.LastKnownMaxAbsPos or not State.LastKnownMaxAbsSize then
-		return false
+local function formatUiNodeProps(inst: Instance): string
+	local props = {}
+
+	if inst:IsA("ScreenGui") then
+		table.insert(props, "Enabled=" .. tostring(inst.Enabled))
+		table.insert(props, "DisplayOrder=" .. tostring(inst.DisplayOrder))
 	end
-	local pos = State.LastKnownMaxAbsPos
-	local size = State.LastKnownMaxAbsSize
 
-	-- Testa tanto com coordenada descontando o GuiInset quanto bruta (para ScreenGuis com IgnoreGuiInset)
-	for _, testPt in ipairs({ screenPos - inset, screenPos }) do
-		if testPt.X >= pos.X and testPt.X <= (pos.X + size.X)
-			and testPt.Y >= pos.Y and testPt.Y <= (pos.Y + size.Y) then
-			return true
-		end
-	end
-	return false
-end
-
-local function setupGlobalMouseCapture()
-	local conn = UserInputService.InputBegan:Connect(function(input: InputObject, _gameProcessed: boolean)
-		if input.UserInputType ~= Enum.UserInputType.MouseButton1
-			and input.UserInputType ~= Enum.UserInputType.Touch then
-			return
-		end
-
-		local now = os.clock()
-		local mouseLoc = UserInputService:GetMouseLocation()
-		local inset = GuiService:GetGuiInset()
-
-		-- Ignora cliques feitos dentro da nossa própria janela de diagnóstico
-		local hitGuis = {} :: {GuiObject}
-		local seen = {} :: {[GuiObject]: boolean}
-
+	if inst:IsA("GuiObject") then
+		table.insert(props, "Visible=" .. tostring(inst.Visible))
+		table.insert(props, "Active=" .. tostring(inst.Active))
 		pcall(function()
-			-- Consulta na coordenada ajustada pelo Topbar Inset e na coordenada bruta
-			local listA = PlayerGui:GetGuiObjectsAtPosition(mouseLoc.X - inset.X, mouseLoc.Y - inset.Y)
-			local listB = PlayerGui:GetGuiObjectsAtPosition(mouseLoc.X, mouseLoc.Y)
-			for _, g in ipairs(listA) do
-				if not seen[g] then seen[g] = true; table.insert(hitGuis, g) end
-			end
-			for _, g in ipairs(listB) do
-				if not seen[g] then seen[g] = true; table.insert(hitGuis, g) end
-			end
+			table.insert(props, "Interactable=" .. tostring((inst :: any).Interactable))
 		end)
-
-		local topPaths = {}
-		local hitMaxHierarchy = false
-		local hitSingleHierarchy = false
-		local hitAutoHierarchy = false
-
-		for i, g in ipairs(hitGuis) do
-			local p = getCleanPath(g)
-			if string.find(p, "StarTimingDiagnosticUI", 1, true) then
-				return -- Clique na UI do próprio script, ignora completamente
-			end
-			if i <= 6 then
-				table.insert(topPaths, string.format("  %s [%s] (Active=%s)", p, getInstanceUID(g), tostring(g.Active)))
-			end
-
-			local bKind = classifyStarButtonHierarchy(g)
-			if bKind == "MAX" then hitMaxHierarchy = true
-			elseif bKind == "SINGLE" then hitSingleHierarchy = true
-			elseif bKind == "AUTO" then hitAutoHierarchy = true
-			end
-		end
-
-		if State.IsRunning then
-			State.RawMouseClicks += 1
-		end
-
-		local insideMaxGeometricBox = isPointInsideLastMaxRect(mouseLoc, inset)
-		local classification = "OTHER_CLICK"
-
-		if hitMaxHierarchy then
-			classification = "MAX_CLICK_RAW"
-		elseif insideMaxGeometricBox then
-			-- O cursor clicou exatamente na coordenada do botão MAX, mas o botão MAX estava oculto/removido!
-			classification = "MAX_CLICK_RAW (GEOMETRIC_HIT_BUTTON_HIDDEN_OR_REPLACED)"
-			if State.IsRunning then
-				State.BlockedOverlayClicks += 1
-			end
-		elseif hitSingleHierarchy then
-			classification = "SINGLE_CLICK_RAW"
-		elseif hitAutoHierarchy then
-			classification = "AUTO_CLICK_RAW"
-		end
-
-		if string.find(classification, "MAX_CLICK_RAW", 1, true) then
-			if State.LastPhysicalMaxClickTime ~= nil then
-				local cDelta = now - State.LastPhysicalMaxClickTime
-				if State.IsRunning then
-					table.insert(State.ClickIntervals, cDelta)
-					if cDelta < State.MinClickToClick then
-						State.MinClickToClick = cDelta
-					end
-				end
-			end
-			State.LastPhysicalMaxClickTime = now
-
-			if State.IsRunning then
-				State.PhysicalMaxClicks += 1
-				table.insert(State.CycleRawMaxClicks, now)
-			end
-		end
-
-		if DEBUG and (classification ~= "OTHER_CLICK" or #topPaths > 0) then
-			local guiListStr = (#topPaths > 0) and table.concat(topPaths, "\n") or "  (Nenhum GuiObject visível no PlayerGui)"
-			print(string.format(
-				"[RAW MOUSE INPUT]\nT = %.3f\nMouse = %d, %d\n\nGUI sob cursor:\n%s\n\nCLASSIFICAÇÃO:\n%s",
-				now, math.floor(mouseLoc.X), math.floor(mouseLoc.Y), guiListStr, classification
-			))
-		end
-	end)
-
-	table.insert(Connections, conn)
-end
-
--- ============================================================================
--- 6 & 7. FONTE DE VERDADE: PITY & TIMELINE POR CICLO
--- ============================================================================
-local function onPityTextChanged(rawText: string)
-	local newCur, newMax = parsePityNumbers(rawText)
-	if not newCur then return end
-
-	if State.LastPityValue == nil then
-		State.LastPityValue = newCur
-		State.LastPityMax = newMax
-		if DEBUG then
-			print(string.format("[PITY SYNC] Valor inicial: %d/%s", newCur, tostring(newMax or "?")))
-		end
-		return
 	end
 
-	local oldCur = State.LastPityValue
-	local oldMax = State.LastPityMax or newMax
-	if newCur == oldCur then return end
-
-	local now = os.clock()
-	if State.LastPityTime and (now - State.LastPityTime) < PITY_DEDUP_WINDOW then
-		State.LastPityValue = newCur
-		State.LastPityMax = newMax
-		return
-	end
-
-	local delta = newCur - oldCur
-	if delta <= 0 then
-		if oldMax and ((oldMax - oldCur) + newCur) > 0 and ((oldMax - oldCur) + newCur) <= 20 then
-			delta = (oldMax - oldCur) + newCur
-		elseif newCur > 0 and newCur <= 20 then
-			delta = newCur
-		else
-			delta = DEFAULT_MAX_DELTA
+	if inst:IsA("TextLabel") or inst:IsA("TextButton") then
+		local cleanText = string.gsub(inst.Text, "\n", " ")
+		if #cleanText > 40 then
+			cleanText = string.sub(cleanText, 1, 40) .. "..."
 		end
-	end
-
-	local pityToPity: number? = nil
-	if State.LastPityTime ~= nil then
-		pityToPity = now - State.LastPityTime
-		State.LastPityToPity = pityToPity
-	end
-
-	if State.LastPhysicalMaxClickTime ~= nil then
-		State.LastClickToPity = now - State.LastPhysicalMaxClickTime
-	end
-
-	State.LastPityValue = newCur
-	State.LastPityMax = newMax
-	State.LastPityTime = now
-
-	if State.IsRunning then
-		State.RealOpenings += 1
-		State.RealRolls += delta
-
-		if pityToPity then
-			table.insert(State.PityIntervals, pityToPity)
-			if pityToPity < State.MinPityToPity then
-				State.MinPityToPity = pityToPity
-			end
-		end
-	end
-
-	local cycleNum = State.IsRunning and State.RealOpenings or 0
-
-	-- Formata listas do ciclo para o F9
-	local rawClicksLines = {}
-	for _, t in ipairs(State.CycleRawMaxClicks) do
-		table.insert(rawClicksLines, string.format("%.3f", t))
-	end
-
-	local actLines = {}
-	for _, t in ipairs(State.CycleButtonActivated) do
-		table.insert(actLines, string.format("%.3f", t))
-	end
-
-	local flagLines = {}
-	for _, fl in ipairs(State.CycleFlags) do
-		table.insert(flagLines, string.format("%s: %s -> %s @ %.3f", fl.path, fl.oldVal, fl.newVal, fl.timestamp))
-	end
-
-	if DEBUG then
-		print(string.format(
-			"\n===== CYCLE #%d =====\n\n" ..
-			"RAW MAX CLICKS:\n%s\n\n" ..
-			"BUTTON ACTIVATED:\n%s\n\n" ..
-			"FLAGS:\n%s\n\n" ..
-			"PITY:\n%d -> %d (Delta: +%d)\n@ %.3f\n\n" ..
-			"PITY -> PITY:\n%s\n\n" ..
-			"Total cliques físicos nesse ciclo:\n%d\n" ..
-			"=====================",
-			cycleNum,
-			(#rawClicksLines > 0) and table.concat(rawClicksLines, "\n") or "(Nenhum clique físico no MAX registrado neste ciclo)",
-			(#actLines > 0) and table.concat(actLines, "\n") or "(Nenhum evento .Activated disparado neste ciclo)",
-			(#flagLines > 0) and table.concat(flagLines, "\n") or "(Nenhuma mudança de flag/estado capturada)",
-			oldCur, newCur, delta,
-			now,
-			pityToPity and string.format("%.3fs", pityToPity) or "1ª abertura da sessão",
-			#State.CycleRawMaxClicks
-		))
-	end
-
-	-- Limpa acumuladores do ciclo recém-fechado
-	table.clear(State.CycleRawMaxClicks)
-	table.clear(State.CycleButtonActivated)
-	table.clear(State.CycleButtonEvents)
-	table.clear(State.CycleFlags)
-end
-
--- ============================================================================
--- ESCANEAMENTO DE ESTADOS LOCAIS, BOTÕES E PITY
--- ============================================================================
-local function watchValueBase(valObj: ValueBase)
-	if WatchedInstances[valObj] then return end
-	if not (valObj:IsA("BoolValue") or valObj:IsA("IntValue") or valObj:IsA("NumberValue") or valObj:IsA("StringValue")) then
-		return
-	end
-
-	local path = getCleanPath(valObj)
-	if string.find(path, "Frames.Star.Pity", 1, true) then return end
-	if containsKeyword(path, IGNORE_KEYWORDS) then return end
-	if not containsKeyword(path, GATE_KEYWORDS) then return end
-
-	WatchedInstances[valObj] = true
-	local propObj = valObj :: any
-	local lastVal = propObj.Value
-
-	table.insert(Connections, propObj:GetPropertyChangedSignal("Value"):Connect(function()
-		local newVal = propObj.Value
-		if newVal ~= lastVal then
-			local prev = lastVal
-			lastVal = newVal
-			recordStateTransition(path, prev, newVal)
-		end
-	end))
-end
-
-local function watchAttributes(inst: Instance, forceAll: boolean)
-	local attrKey = "attr_" .. getInstanceUID(inst)
-	if WatchedInstances[attrKey :: any] then return end
-
-	local basePath = (inst == LocalPlayer) and "LocalPlayer" or getCleanPath(inst)
-	if not forceAll and not containsKeyword(basePath, GATE_KEYWORDS) then
-		local hasRelevant = false
-		for k in pairs(inst:GetAttributes()) do
-			if containsKeyword(k, GATE_KEYWORDS) then
-				hasRelevant = true
-				break
-			end
-		end
-		if not hasRelevant then return end
-	end
-
-	WatchedInstances[attrKey :: any] = true
-	local cached = inst:GetAttributes()
-
-	table.insert(Connections, inst.AttributeChanged:Connect(function(attrName: string)
-		local newVal = inst:GetAttribute(attrName)
-		local oldVal = cached[attrName]
-		cached[attrName] = newVal
-		if containsKeyword(attrName, IGNORE_KEYWORDS) then return end
-		if forceAll or containsKeyword(attrName, GATE_KEYWORDS) or containsKeyword(basePath, GATE_KEYWORDS) then
-			recordStateTransition(basePath .. ".Attribute." .. attrName, oldVal, newVal)
-		end
-	end))
-end
-
-local function inspectStarDescendant(inst: Instance)
-	local bKind = classifyStarButtonHierarchy(inst)
-	if bKind then
-		if inst:IsA("GuiButton") then
-			hookGuiButtonEvents(inst, bKind)
-		elseif inst:IsA("GuiObject") and bKind == "MAX" then
-			watchButtonProperties(inst, getCleanPath(inst), "MAX_CONTAINER")
-			if inst.AbsoluteSize.X > 0 and not State.LastKnownMaxAbsPos then
-				State.LastKnownMaxAbsPos = inst.AbsolutePosition
-				State.LastKnownMaxAbsSize = inst.AbsoluteSize
-			end
-		end
+		table.insert(props, string.format('Text="%s"', cleanText))
 	end
 
 	if inst:IsA("ValueBase") then
-		watchValueBase(inst)
+		table.insert(props, "Value=" .. tostring((inst :: any).Value))
 	end
-	if containsKeyword(inst.Name, GATE_KEYWORDS) then
-		watchAttributes(inst, true)
+
+	if #props == 0 then
+		return ""
 	end
+	return " [" .. table.concat(props, " | ") .. "]"
 end
 
-local function clearConnections()
-	for _, c in ipairs(Connections) do
+local function dumpUiTree(rootInst: Instance?, labelTitle: string): {string}
+	local lines = {}
+	table.insert(lines, string.format("--- %s ---", labelTitle))
+
+	if not rootInst then
+		table.insert(lines, "  [NÃO ENCONTRADO NO PLAYERGUI ATUALMENTE]")
+		return lines
+	end
+
+	local function traverse(node: Instance, depth: number)
+		local indent = string.rep("  ", depth)
+		local path = getCleanPath(node)
+		local propSummary = formatUiNodeProps(node)
+		table.insert(lines, string.format(
+			"%s- [%s] %s (%s)%s | Path: %s",
+			indent, node.ClassName, node.Name, getUID(node), propSummary, path
+		))
+
+		-- Verifica dependências visíveis também em frames/botões da UI da Star
+		if node:IsA("ObjectValue") then
+			local target = node.Value and getCleanPath(node.Value) or "nil"
+			table.insert(lines, string.format("%s    -> ObjectValue Target: %s", indent, target))
+		end
+
+		for _, child in ipairs(node:GetChildren()) do
+			traverse(child, depth + 1)
+		end
+	end
+
+	traverse(rootInst, 0)
+	return lines
+end
+
+local function getTargetUiRoots()
+	local ui = PlayerGui:FindFirstChild("UI")
+	local frames = ui and ui:FindFirstChild("Frames")
+	local starFrame = frames and frames:FindFirstChild("Star")
+	local rollingGui = PlayerGui:FindFirstChild("Rolling")
+	local starAnimGui = PlayerGui:FindFirstChild("StarAnimation")
+	return starFrame, rollingGui, starAnimGui
+end
+
+-- ============================================================================
+-- 4. [CAPTURE ROLL] — TRACE DE 3 SEGUNDOS ANTES/DURANTE/DEPOIS DA ABERTURA
+-- ============================================================================
+local function stopRollCaptureConnections()
+	for _, c in ipairs(TraceConnections) do
 		if c.Connected then
 			c:Disconnect()
 		end
 	end
-	table.clear(Connections)
-	table.clear(WatchedInstances)
+	table.clear(TraceConnections)
 end
 
-local function scanAndConnectAll()
-	clearConnections()
-	setupGlobalMouseCapture()
-
-	-- 1. Conecta Pity (PlayerGui.UI.Frames.Star.Pity.Value)
-	local ui = PlayerGui:FindFirstChild("UI")
-	local frames = ui and ui:FindFirstChild("Frames")
-	local starFrame = frames and frames:FindFirstChild("Star")
-	local pityFolder = starFrame and starFrame:FindFirstChild("Pity")
-	local pityTarget: Instance? = pityFolder and (pityFolder:FindFirstChild("Value") or (pityFolder:IsA("TextLabel") and pityFolder or nil))
-
-	if not pityTarget then
-		for _, desc in ipairs(PlayerGui:GetDescendants()) do
-			if desc:IsA("TextLabel") and string.find(string.lower(desc.Text), "pity", 1, true) then
-				pityTarget = desc
-				break
-			end
-		end
+local function runRollCapture(onFinishedCallback: (() -> ())?)
+	if Inventory.IsCapturingRoll then
+		warn("[INSPECTOR] Uma captura de Roll já está em andamento!")
+		return
 	end
 
-	if pityTarget then
-		State.PityPath = getCleanPath(pityTarget)
-		if pityTarget:IsA("TextLabel") then
-			State.LastPityValue, State.LastPityMax = parsePityNumbers(pityTarget.Text)
-			table.insert(Connections, pityTarget:GetPropertyChangedSignal("Text"):Connect(function()
-				onPityTextChanged(pityTarget.Text)
+	Inventory.IsCapturingRoll = true
+	stopRollCaptureConnections()
+	table.clear(Inventory.LastRollTrace)
+
+	local t0 = os.clock()
+	local lastPityChangeTimestamp: number? = nil
+	local rawTraceEvents = {} :: {{ relTime: number, text: string, path: string?, inst: Instance?, className: string?, name: string? }}
+
+	local function logTrace(msg: string, inst: Instance?, customPath: string?)
+		local now = os.clock()
+		local rel = math.max(0, now - t0)
+		local path = customPath or (inst and getCleanPath(inst) or nil)
+		table.insert(rawTraceEvents, {
+			relTime = rel,
+			text = string.format("T+%.3f\n%s", rel, msg),
+			path = path,
+			inst = inst,
+			className = inst and inst.ClassName or "State",
+			name = inst and inst.Name or (customPath or "Event"),
+		})
+	end
+
+	print(string.format("\n[INSPECTOR] Iniciando CAPTURE ROLL por %.1f segundos! Abra uma Star agora...", CAPTURE_DURATION))
+
+	-- 1. Snapshot inicial em T+0.000
+	local starFrame, rollingGui, starAnimGui = getTargetUiRoots()
+	local pityLabel = starFrame and starFrame:FindFirstChild("Pity") and starFrame.Pity:FindFirstChild("Value")
+	local maxBtn = starFrame and starFrame:FindFirstChild("Buttons") and starFrame.Buttons:FindFirstChild("Max") and starFrame.Buttons.Max:FindFirstChild("Main")
+
+	local initLines = {}
+	if starFrame and starFrame:IsA("GuiObject") then
+		table.insert(initLines, string.format("Star.Visible = %s", tostring(starFrame.Visible)))
+	end
+	if maxBtn and maxBtn:IsA("GuiObject") then
+		table.insert(initLines, string.format("Buttons.Max.Main: Visible=%s | Active=%s", tostring(maxBtn.Visible), tostring(maxBtn.Active)))
+	end
+	if rollingGui then
+		local rProp = rollingGui:IsA("ScreenGui") and ("Enabled=" .. tostring(rollingGui.Enabled))
+			or (rollingGui:IsA("GuiObject") and ("Visible=" .. tostring(rollingGui.Visible)) or "Present")
+		table.insert(initLines, "PlayerGui.Rolling: " .. rProp)
+	end
+	if starAnimGui then
+		local sProp = starAnimGui:IsA("ScreenGui") and ("Enabled=" .. tostring(starAnimGui.Enabled))
+			or (starAnimGui:IsA("GuiObject") and ("Visible=" .. tostring(starAnimGui.Visible)) or "Present")
+		table.insert(initLines, "PlayerGui.StarAnimation: " .. sProp)
+	end
+	if pityLabel and pityLabel:IsA("TextLabel") then
+		table.insert(initLines, "Pity initial = " .. pityLabel.Text)
+	end
+	logTrace(table.concat(initLines, "\n"), nil, nil)
+
+	-- Helper para conectar monitoramento de propriedades em um objeto durante os 3 segundos
+	local hookedInTrace = setmetatable({}, { __mode = "k" }) :: {[Instance]: boolean}
+
+	local function hookInstanceForTrace(inst: Instance)
+		if hookedInTrace[inst] or isInspectorObject(inst) then return end
+		local path = getCleanPath(inst)
+		if isIgnoredPath(path) then return end
+		hookedInTrace[inst] = true
+
+		-- Pity oficial
+		if path == "PlayerGui.UI.Frames.Star.Pity.Value" and inst:IsA("TextLabel") then
+			local lastText = inst.Text
+			table.insert(TraceConnections, inst:GetPropertyChangedSignal("Text"):Connect(function()
+				local newText = inst.Text
+				if newText ~= lastText then
+					local oldC, _ = parsePityNumbers(lastText)
+					local newC, _ = parsePityNumbers(newText)
+					local prev = lastText
+					lastText = newText
+					lastPityChangeTimestamp = os.clock()
+					logTrace(string.format("PITY CHANGED: %s -> %s", tostring(oldC or prev), tostring(newC or newText)), inst, path)
+					registerCandidateEvidence(inst, inst.ClassName, inst.Name, "Changed during Roll Trace (Pity)", 8, true)
+				end
 			end))
-		elseif pityTarget:IsA("ValueBase") then
-			local vObj = pityTarget :: any
-			State.LastPityValue, State.LastPityMax = parsePityNumbers(tostring(vObj.Value))
-			table.insert(Connections, vObj:GetPropertyChangedSignal("Value"):Connect(function()
-				onPityTextChanged(tostring(vObj.Value))
+		end
+
+		-- GuiObject Visible / Active / Interactable
+		if inst:IsA("GuiObject") then
+			local lastVis = inst.Visible
+			table.insert(TraceConnections, inst:GetPropertyChangedSignal("Visible"):Connect(function()
+				local v = inst.Visible
+				if v ~= lastVis then
+					lastVis = v
+					logTrace(string.format("%s.Visible = %s", path, tostring(v)), inst, path)
+					registerCandidateEvidence(inst, inst.ClassName, inst.Name, "Visible toggled during Roll Trace", 4, true)
+				end
+			end))
+
+			local lastAct = inst.Active
+			table.insert(TraceConnections, inst:GetPropertyChangedSignal("Active"):Connect(function()
+				local v = inst.Active
+				if v ~= lastAct then
+					lastAct = v
+					logTrace(string.format("%s.Active = %s", path, tostring(v)), inst, path)
+					registerCandidateEvidence(inst, inst.ClassName, inst.Name, "Active toggled during Roll Trace", 3, true)
+				end
 			end))
 		end
-		print(string.format("[STAR DIAGNOSTIC v5] Pity conectado: %s [%s]", State.PityPath, getInstanceUID(pityTarget)))
-	else
-		warn("[STAR DIAGNOSTIC v5] PlayerGui.UI.Frames.Star.Pity.Value não encontrado.")
-	end
 
-	-- 2. Monitora Frame Star, Buttons.Max e toda a sub-árvore de UI
-	if starFrame then
-		watchButtonProperties(starFrame, getCleanPath(starFrame), "STAR_FRAME")
-		watchAttributes(starFrame, true)
-		for _, desc in ipairs(starFrame:GetDescendants()) do
-			inspectStarDescendant(desc)
+		-- ScreenGui / Efeitos Enabled
+		if inst:IsA("ScreenGui") or inst:IsA("ParticleEmitter") or inst:IsA("Beam") or inst:IsA("Highlight") or inst:IsA("LocalScript") then
+			pcall(function()
+				local propObj = inst :: any
+				local lastEn = propObj.Enabled
+				table.insert(TraceConnections, inst:GetPropertyChangedSignal("Enabled"):Connect(function()
+					local v = propObj.Enabled
+					if v ~= lastEn then
+						lastEn = v
+						logTrace(string.format("%s.Enabled = %s", path, tostring(v)), inst, path)
+						registerCandidateEvidence(inst, inst.ClassName, inst.Name, "Enabled toggled during Roll Trace", 4, true)
+					end
+				end))
+			end)
+		end
+
+		-- ValueBase
+		if inst:IsA("BoolValue") or inst:IsA("NumberValue") or inst:IsA("IntValue") or inst:IsA("StringValue") or inst:IsA("ObjectValue") then
+			local vObj = inst :: any
+			local lastVal = vObj.Value
+			table.insert(TraceConnections, vObj:GetPropertyChangedSignal("Value"):Connect(function()
+				local newVal = vObj.Value
+				if newVal ~= lastVal then
+					local prev = lastVal
+					lastVal = newVal
+					logTrace(string.format("VALUE CHANGED: %s (%s -> %s)", path, tostring(prev), tostring(newVal)), inst, path)
+					registerCandidateEvidence(inst, inst.ClassName, inst.Name, "Value changed during Roll Trace", 5, true)
+				end
+			end))
+		end
+
+		-- Attributes
+		local cachedAttrs = inst:GetAttributes()
+		table.insert(TraceConnections, inst.AttributeChanged:Connect(function(attrName: string)
+			local newVal = inst:GetAttribute(attrName)
+			local oldVal = cachedAttrs[attrName]
+			cachedAttrs[attrName] = newVal
+			local attrPath = path .. ".Attribute." .. attrName
+			logTrace(string.format("ATTRIBUTE CHANGED: %s (%s -> %s)", attrPath, tostring(oldVal), tostring(newVal)), nil, attrPath)
+			registerCandidateEvidence(attrPath, "Attribute", attrName, "Attribute changed during Roll Trace", 5, true)
+		end))
+
+		-- AnimationTracks iniciadas
+		if inst:IsA("Animator") or inst:IsA("AnimationController") or inst:IsA("Humanoid") then
+			if not (LocalPlayer.Character and inst:IsDescendantOf(LocalPlayer.Character)) then
+				table.insert(TraceConnections, (inst :: any).AnimationPlayed:Connect(function(track: AnimationTrack)
+					local animId = track.Animation and track.Animation.AnimationId or "Unknown"
+					logTrace(string.format("ANIMATION STARTED:\nAnimator: %s\nAnimationId: %s (Length: %.2fs)", path, animId, track.Length), inst, path)
+					registerCandidateEvidence(inst, inst.ClassName, inst.Name, "Played Animation during Roll Trace", 5, true)
+				end))
+			end
 		end
 	end
 
-	-- Monitora criação dinâmica de novos botões (caso Buttons.Max seja recriado durante o giro!)
-	table.insert(Connections, PlayerGui.DescendantAdded:Connect(function(desc)
-		inspectStarDescendant(desc)
-		-- Faz uma segunda verificação no frame seguinte caso as propriedades/nomes sejam atribuídos depois do Parent
-		task.defer(function()
-			if desc and desc.Parent then
-				inspectStarDescendant(desc)
-			end
-		end)
-	end))
-
-	-- 3. Monitora estados/flags em LocalPlayer, PlayerScripts, ReplicatedStorage e Workspace
-	watchAttributes(LocalPlayer, true)
-	local containers = { LocalPlayer, PlayerGui, ReplicatedStorage }
-	if PlayerScripts then
-		table.insert(containers, PlayerScripts)
-	end
-
-	for _, cont in ipairs(containers) do
-		for _, desc in ipairs(cont:GetDescendants()) do
-			if desc:IsA("ValueBase") then
-				watchValueBase(desc)
-			end
-			if containsKeyword(desc.Name, GATE_KEYWORDS) then
-				watchAttributes(desc, true)
+	-- Conecta em LocalPlayer e nas árvores relevantes
+	hookInstanceForTrace(LocalPlayer)
+	for _, root in ipairs({ PlayerGui, Workspace, ReplicatedStorage }) do
+		for _, desc in ipairs(root:GetDescendants()) do
+			if root == PlayerGui
+				or desc:IsA("ValueBase")
+				or desc:IsA("Animator")
+				or desc:IsA("AnimationController")
+				or next(desc:GetAttributes()) ~= nil
+				or matchesKeywords(getCleanPath(desc), SCRIPT_KEYWORDS) then
+				hookInstanceForTrace(desc)
 			end
 		end
+
+		-- Monitora novas Instances criadas e removidas durante os 3s
+		table.insert(TraceConnections, root.DescendantAdded:Connect(function(desc)
+			if isInspectorObject(desc) then return end
+			local p = getCleanPath(desc)
+			if isIgnoredPath(p) then return end
+			logTrace(string.format("NEW INSTANCE (%s [%s]):\n%s", desc.ClassName, getUID(desc), p), desc, p)
+			registerCandidateEvidence(desc, desc.ClassName, desc.Name, "Created during Roll Trace", 4, true)
+			hookInstanceForTrace(desc)
+		end))
+
+		table.insert(TraceConnections, root.DescendantRemoving:Connect(function(desc)
+			if isInspectorObject(desc) then return end
+			local p = getCleanPath(desc)
+			if isIgnoredPath(p) then return end
+			logTrace(string.format("REMOVED INSTANCE (%s [%s]):\n%s", desc.ClassName, getUID(desc), p), desc, p)
+		end))
 	end
 
-	for _, desc in ipairs(Workspace:GetDescendants()) do
-		if desc:IsA("ValueBase") then
-			watchValueBase(desc)
-		elseif containsKeyword(desc.Name, {"star", "summon", "roll", "open", "cache"}) then
-			watchAttributes(desc, true)
+	-- Aguarda os 3 segundos sem travar a thread principal
+	task.delay(CAPTURE_DURATION, function()
+		stopRollCaptureConnections()
+		Inventory.IsCapturingRoll = false
+
+		-- Marca candidatos cujos eventos aconteceram sincronizados com a mudança do Pity (±150ms)
+		local pityRelTime: number? = lastPityChangeTimestamp and (lastPityChangeTimestamp - t0) or nil
+		for _, ev in ipairs(rawTraceEvents) do
+			table.insert(Inventory.LastRollTrace, ev.text)
+			if pityRelTime and ev.path and math.abs(ev.relTime - pityRelTime) <= 0.150 then
+				registerCandidateEvidence(ev.path, ev.className or "Instance", ev.name or "Object", "Synchronized with Pity (<150ms)", 6, false)
+			end
 		end
-	end
+
+		print("\n===== ROLL TRACE =====")
+		for _, entryText in ipairs(Inventory.LastRollTrace) do
+			print("\n" .. entryText)
+		end
+		print("\n======================\n")
+
+		if onFinishedCallback then
+			onFinishedCallback()
+		end
+	end)
 end
 
 -- ============================================================================
--- 9. CLASSIFICAÇÃO AUTOMÁTICA FINAL (CASOS 1, 2, 3 e 4)
+-- 7. MODO DIFF: [SNAPSHOT A], [SNAPSHOT B] E [COMPARE]
 -- ============================================================================
-local function classifyFinalBehavior(): (string, string)
-	if State.RealOpenings < 5 then
-		return "AGUARDANDO DADOS", "Realize cliques rápidos no botão MAX até completar pelo menos 5 a 15 aberturas."
+export type NodeSnapshot = {
+	uid: string,
+	path: string,
+	className: string,
+	name: string,
+	hasVisible: boolean,
+	visible: boolean?,
+	hasEnabled: boolean,
+	enabled: boolean?,
+	hasValue: boolean,
+	value: string?,
+	attributes: {[string]: string},
+}
+
+local function takeStateSnapshot(label: string)
+	local snap = {
+		label = label,
+		timestamp = os.clock(),
+		nodesByUid = {} :: {[string]: NodeSnapshot},
+	}
+
+	local function recordNode(inst: Instance)
+		if isInspectorObject(inst) then return end
+		local path = getCleanPath(inst)
+		if isIgnoredPath(path) then return end
+
+		local uid = getUID(inst)
+		local node: NodeSnapshot = {
+			uid = uid,
+			path = path,
+			className = inst.ClassName,
+			name = inst.Name,
+			hasVisible = false,
+			visible = nil,
+			hasEnabled = false,
+			enabled = nil,
+			hasValue = false,
+			value = nil,
+			attributes = {},
+		}
+
+		if inst:IsA("GuiObject") then
+			node.hasVisible = true
+			node.visible = inst.Visible
+		end
+
+		if inst:IsA("ScreenGui") or inst:IsA("ParticleEmitter") or inst:IsA("Beam") or inst:IsA("Highlight") or inst:IsA("LocalScript") then
+			pcall(function()
+				node.hasEnabled = true
+				node.enabled = (inst :: any).Enabled
+			end)
+		end
+
+		if inst:IsA("BoolValue") or inst:IsA("NumberValue") or inst:IsA("IntValue") or inst:IsA("StringValue") or inst:IsA("ObjectValue") then
+			node.hasValue = true
+			node.value = tostring((inst :: any).Value)
+		elseif inst:IsA("TextLabel") and (
+			string.find(path, "PlayerGui.UI.Frames.Star", 1, true)
+			or string.find(path, "PlayerGui.Rolling", 1, true)
+			or string.find(path, "PlayerGui.StarAnimation", 1, true)
+		) then
+			node.hasValue = true
+			node.value = inst.Text
+		end
+
+		for k, v in pairs(inst:GetAttributes()) do
+			node.attributes[k] = tostring(v)
+		end
+
+		snap.nodesByUid[uid] = node
 	end
 
-	local avgRawClick = getAverage(State.ClickIntervals)
-	local avgBtnClick = getAverage(State.ButtonClickIntervals)
-	local avgPity = getAverage(State.PityIntervals)
+	recordNode(LocalPlayer)
 
-	-- Verifica se os cliques físicos (Raw Mouse) estão rápidos (< 0.35s), mas o botão para de disparar eventos
-	local buttonDropRatio = (State.PhysicalMaxClicks > 0) and (State.GroupedButtonMaxClicks / State.PhysicalMaxClicks) or 1
-	local guiIsBlocking = (avgRawClick > 0 and avgRawClick < 0.35)
-		and ((avgBtnClick >= 0.75) or (buttonDropRatio < 0.45) or (State.BlockedOverlayClicks >= 3))
-
-	-- CASO 3: Existe uma Flag/Propriedade local fortemente correlacionada com o ciclo de ~1s
-	if State.BestGateCandidate ~= "NENHUM" then
-		return "CASO 3: FORTE CANDIDATO A GATING LOCAL",
-			string.format(
-				"Uma flag/propriedade local acompanha o bloqueio entre o clique e a próxima abertura:\n  Gate: %s",
-				State.BestGateCandidate
-			)
+	-- Captura PlayerGui completo e objetos relevantes em ReplicatedStorage e Workspace
+	for _, desc in ipairs(PlayerGui:GetDescendants()) do
+		recordNode(desc)
 	end
 
-	-- CASO 1: Cliques físicos rápidos (~0.1s), mas os eventos do GuiButton só disparam ~1x/s ou são perdidos
-	if guiIsBlocking then
-		return "CASO 1: O PRÓPRIO GUI/BOTÃO ESTÁ BLOQUEANDO INPUTS",
-			string.format(
-				"Cliques físicos chegam a %.3fs (%d cliques no MAX), mas o GuiButton só disparou em %d deles (Substituições de botão: %d | Cliques com botão oculto/coberto: %d).",
-				avgRawClick, State.PhysicalMaxClicks, State.GroupedButtonMaxClicks,
-				State.MaxButtonReplacements, State.BlockedOverlayClicks
-			)
+	for _, root in ipairs({ ReplicatedStorage, Workspace, LocalPlayer }) do
+		for _, desc in ipairs(root:GetDescendants()) do
+			if not desc:IsDescendantOf(PlayerGui) then
+				local p = getCleanPath(desc)
+				if desc:IsA("ValueBase")
+					or next(desc:GetAttributes()) ~= nil
+					or string.find(p, "Cache", 1, true)
+					or matchesKeywords(p, SCRIPT_KEYWORDS) then
+					recordNode(desc)
+				end
+			end
+		end
 	end
 
-	-- CASO 2 / CASO 4: Cliques físicos (~0.1s) e eventos do botão (~0.1s) chegam normalmente, mas o Pity fica em ~1.0s
-	if avgRawClick > 0 and avgRawClick < 0.35 and buttonDropRatio >= 0.65 and avgPity >= 0.85 then
-		if next(State.GateCandidates) == nil then
-			return "CASO 4: NENHUMA TRAVA LOCAL VISÍVEL ENCONTRADA",
-				"Todos os cliques chegam ao GuiButton (~0.1s), nenhuma ValueBase/Attribute/Propriedade visível mudou, e o Pity seguiu em ~1.0s.\n" ..
-				"Conclusão: O bloqueio está em uma variável local privada (upvalue dentro de closure de LocalScript) ou validação/cooldown direto no Servidor."
+	print(string.format("[INSPECTOR] %s capturado em T=%.3f!", label, snap.timestamp))
+	return snap
+end
+
+local function compareSnapshots()
+	if not Inventory.SnapshotA or not Inventory.SnapshotB then
+		warn("[INSPECTOR] Capture primeiro o [SNAPSHOT A] e o [SNAPSHOT B] antes de clicar em [COMPARE]!")
+		return
+	end
+
+	local snapA = Inventory.SnapshotA
+	local snapB = Inventory.SnapshotB
+
+	local added = {}
+	local removed = {}
+	local valueChanged = {}
+	local attrChanged = {}
+	local visChanged = {}
+	local enabledChanged = {}
+
+	-- Verifica REMOVED e mudanças em objetos que existem em ambos
+	for uid, nodeA in pairs(snapA.nodesByUid) do
+		local nodeB = snapB.nodesByUid[uid]
+		if not nodeB then
+			table.insert(removed, string.format("  - [%s] %s (%s)", nodeA.className, nodeA.path, uid))
 		else
-			return "CASO 2: INPUT CHEGA AO BOTÃO, MAS É BLOQUEADO DEPOIS",
-				string.format(
-					"Os eventos do botão disparam normalmente (%.3fs), mas apenas 1 abertura real ocorre a cada %.3fs.",
-					avgBtnClick, avgPity
-				)
+			-- VALUE CHANGED
+			if nodeA.hasValue and nodeB.hasValue and nodeA.value ~= nodeB.value then
+				table.insert(valueChanged, string.format("  * %s: '%s' -> '%s'", nodeB.path, tostring(nodeA.value), tostring(nodeB.value)))
+				registerCandidateEvidence(nodeB.path, nodeB.className, nodeB.name, "Value changed in Diff A/B", 4, true)
+			end
+
+			-- VISIBLE CHANGED
+			if nodeA.hasVisible and nodeB.hasVisible and nodeA.visible ~= nodeB.visible then
+				table.insert(visChanged, string.format("  * %s.Visible: %s -> %s", nodeB.path, tostring(nodeA.visible), tostring(nodeB.visible)))
+				registerCandidateEvidence(nodeB.path, nodeB.className, nodeB.name, "Visible changed in Diff A/B", 4, true)
+			end
+
+			-- ENABLED CHANGED
+			if nodeA.hasEnabled and nodeB.hasEnabled and nodeA.enabled ~= nodeB.enabled then
+				table.insert(enabledChanged, string.format("  * %s.Enabled: %s -> %s", nodeB.path, tostring(nodeA.enabled), tostring(nodeB.enabled)))
+				registerCandidateEvidence(nodeB.path, nodeB.className, nodeB.name, "Enabled changed in Diff A/B", 4, true)
+			end
+
+			-- ATTRIBUTE CHANGED
+			for k, valA in pairs(nodeA.attributes) do
+				local valB = nodeB.attributes[k]
+				if valB == nil then
+					table.insert(attrChanged, string.format("  * %s.Attribute.%s: '%s' -> [REMOVED]", nodeB.path, k, valA))
+				elseif valA ~= valB then
+					table.insert(attrChanged, string.format("  * %s.Attribute.%s: '%s' -> '%s'", nodeB.path, k, valA, valB))
+					registerCandidateEvidence(nodeB.path .. ".Attribute." .. k, "Attribute", k, "Attribute changed in Diff A/B", 4, true)
+				end
+			end
+			for k, valB in pairs(nodeB.attributes) do
+				if nodeA.attributes[k] == nil then
+					table.insert(attrChanged, string.format("  * %s.Attribute.%s: [ADDED] -> '%s'", nodeB.path, k, valB))
+					registerCandidateEvidence(nodeB.path .. ".Attribute." .. k, "Attribute", k, "Attribute added in Diff A/B", 4, true)
+				end
+			end
 		end
 	end
 
-	return "EM ANÁLISE", string.format("Click médio: %.3fs | Pity médio: %.3fs", avgRawClick, avgPity)
-end
+	-- Verifica ADDED (presentes em B, ausentes em A)
+	for uid, nodeB in pairs(snapB.nodesByUid) do
+		if not snapA.nodesByUid[uid] then
+			table.insert(added, string.format("  + [%s] %s (%s)", nodeB.className, nodeB.path, uid))
+			registerCandidateEvidence(nodeB.path, nodeB.className, nodeB.name, "Instance added in Diff A/B", 4, true)
+		end
+	end
 
-local function printFinalReport()
-	local clicksPerOpening = (State.RealOpenings > 0) and (State.PhysicalMaxClicks / State.RealOpenings) or 0
-	local minClick = (State.MinClickToClick == math.huge) and 0 or State.MinClickToClick
-	local minPity = (State.MinPityToPity == math.huge) and 0 or State.MinPityToPity
-	local avgRawClick = getAverage(State.ClickIntervals)
-	local avgBtnClick = getAverage(State.ButtonClickIntervals)
-	local avgPity = getAverage(State.PityIntervals)
-	local verdictTitle, verdictDetail = classifyFinalBehavior()
+	table.clear(Inventory.LastDiffReport)
+	local function addSection(title: string, list: {string})
+		table.insert(Inventory.LastDiffReport, title)
+		if #list == 0 then
+			table.insert(Inventory.LastDiffReport, "  (Nenhuma diferença)")
+		else
+			for _, item in ipairs(list) do
+				table.insert(Inventory.LastDiffReport, item)
+			end
+		end
+	end
 
-	print("\n================ STAR TIMING DIAGNOSTIC v5 (RELATÓRIO FINAL) ================")
-	print(string.format("RAW MOUSE CLICKS: %d", State.RawMouseClicks))
-	print(string.format("PHYSICAL MAX CLICKS (Sobre o MAX): %d", State.PhysicalMaxClicks))
-	print(string.format("BUTTON EVENTS (Down+Up+Activated): %d", State.ButtonEventsCount))
-	print(string.format("CLIQUES QUE ATIVARAM O BOTÃO: %d (.Activated = %d)", State.GroupedButtonMaxClicks, State.ButtonActivatedCount))
-	print(string.format("SUBSTITUIÇÕES DE INSTANCE DO BOTÃO MAX: %d", State.MaxButtonReplacements))
-	print("-----------------------------------------------------------------------------")
-	print(string.format("ABERTURAS REAIS (Pity): %d", State.RealOpenings))
-	print(string.format("ROLLS REAIS: %d", State.RealRolls))
-	print(string.format("CLIQUES FÍSICOS / ABERTURA: %.2f", clicksPerOpening))
-	print("-----------------------------------------------------------------------------")
-	print(string.format("CLICK -> CLICK (Físico)  | Médio: %.3fs | Mínimo: %.3fs", avgRawClick, minClick))
-	print(string.format("EVENT -> EVENT (Botão)   | Médio: %.3fs", avgBtnClick))
-	print(string.format("PITY -> PITY (Real)      | Médio: %.3fs | Mínimo: %.3fs", avgPity, minPity))
-	print(string.format("ÚLTIMO CLICK -> PITY: %.3fs", State.LastClickToPity))
-	print(string.format("POSSÍVEL GATE: %s", State.BestGateCandidate))
-	print("\nDIAGNÓSTICO FINAL:")
-	print("  " .. verdictTitle)
-	print("  " .. verdictDetail)
-	print("=============================================================================\n")
+	addSection("ADDED:", added)
+	addSection("REMOVED:", removed)
+	addSection("VALUE CHANGED:", valueChanged)
+	addSection("ATTRIBUTE CHANGED:", attrChanged)
+	addSection("VISIBLE CHANGED:", visChanged)
+	addSection("ENABLED CHANGED:", enabledChanged)
+
+	print("\n================ SNAPSHOT DIFF (A vs B) ================")
+	for _, line in ipairs(Inventory.LastDiffReport) do
+		print(line)
+	end
+	print("========================================================\n")
 end
 
 -- ============================================================================
--- 8. INTERFACE GRÁFICA (PAINEL V5)
+-- 8. FUNÇÃO GLOBAL printFullReport() E SEÇÕES COMPLETAS
 -- ============================================================================
-local function createUI()
+local function scanAllStaticInventories()
+	scanScriptsAndModules()
+	scanRemotes()
+	scanStatesAndAnimations()
+end
+
+local function printFullReport()
+	scanAllStaticInventories()
+	local starFrame, rollingGui, starAnimGui = getTargetUiRoots()
+
+	print("\n======================================================================")
+	print("             ANIME LEGACY CLIENT / GACHA INSPECTOR REPORT             ")
+	print("======================================================================\n")
+
+	-- 1. === SCRIPTS ===
+	print("=== SCRIPTS ===")
+	print(string.format("Total LocalScripts/Scripts escaneados: %d", #Inventory.Scripts))
+	for _, s in ipairs(Inventory.Scripts) do
+		if s.isCandidate then
+			print(string.format(
+				"[CANDIDATE] CLASS: %s | NAME: %s | ENABLED: %s\n  PATH: %s\n  SOURCE: %s",
+				s.className, s.name, s.enabled, s.path, s.sourceStatus
+			))
+		end
+	end
+
+	-- 2. === MODULES ===
+	print("\n=== MODULES ===")
+	print(string.format("Total ModuleScripts escaneados: %d", #Inventory.Modules))
+	for _, m in ipairs(Inventory.Modules) do
+		if m.isCandidate then
+			print(string.format(
+				"[CANDIDATE] CLASS: %s | NAME: %s | ENABLED: %s\n  PATH: %s\n  SOURCE: %s",
+				m.className, m.name, m.enabled, m.path, m.sourceStatus
+			))
+		end
+	end
+
+	print("\n===== SCRIPT/MODULE CANDIDATES =====")
+	if #Inventory.ScriptCandidates == 0 then
+		print("  (Nenhum Script/Module com nome correspondente encontrado)")
+	else
+		for _, c in ipairs(Inventory.ScriptCandidates) do
+			print(string.format(
+				"CLASS: %s\nPATH: %s\nNAME: %s\nENABLED: %s\nSOURCE: %s\n",
+				c.className, c.path, c.name, c.enabled, c.sourceStatus
+			))
+		end
+	end
+
+	print("----- MAPA DE DEPENDÊNCIAS VISÍVEIS -----")
+	print("Nota: Grafo interno de require() e upvalues em memória: NOT OBSERVABLE WITH CURRENT ACCESS")
+	if #Inventory.Dependencies == 0 then
+		print("  (Nenhuma ObjectValue/Atributo/Filho visível nos scripts escaneados)")
+	else
+		for _, dep in ipairs(Inventory.Dependencies) do
+			local isRel, _ = matchesKeywords(dep.ownerPath, SCRIPT_KEYWORDS)
+			if isRel then
+				print(string.format("Owner: %s (%s)", dep.ownerPath, dep.ownerClass))
+				for _, item in ipairs(dep.items) do
+					print("  -> " .. item)
+				end
+			end
+		end
+	end
+
+	-- 3. === REMOTES ===
+	print("\n=== REMOTES ===")
+	print("Nota: Interceptação passiva de FireServer/InvokeServer: NOT OBSERVABLE WITH CURRENT ACCESS")
+	for _, r in ipairs(Inventory.Remotes) do
+		local tag = r.isCandidate and "[CANDIDATE] " or ""
+		print(string.format("%sCLASS: %-22s | NAME: %-20s | PATH: %s", tag, r.className, r.name, r.path))
+	end
+
+	-- 4. === STATES ===
+	print("\n=== STATES ===")
+	if #Inventory.States == 0 then
+		print("  (Nenhum State/Attribute correspondente encontrado)")
+	else
+		for _, st in ipairs(Inventory.States) do
+			local tag = st.isCandidate and "[CANDIDATE] " or ""
+			print(string.format("%s[%s] %s = %s", tag, st.kind, st.path, st.value))
+		end
+	end
+
+	-- 5. === STAR UI TREE ===
+	print("\n=== STAR UI TREE ===")
+	local starLines = dumpUiTree(starFrame, "PlayerGui.UI.Frames.Star")
+	for _, l in ipairs(starLines) do
+		print(l)
+	end
+
+	-- 6. === ROLLING UI TREE ===
+	print("\n=== ROLLING UI TREE ===")
+	local rollingLines = dumpUiTree(rollingGui, "PlayerGui.Rolling")
+	for _, l in ipairs(rollingLines) do
+		print(l)
+	end
+	local starAnimLines = dumpUiTree(starAnimGui, "PlayerGui.StarAnimation")
+	for _, l in ipairs(starAnimLines) do
+		print(l)
+	end
+
+	-- 7. === ANIMATION OBJECTS ===
+	print("\n=== ANIMATION OBJECTS ===")
+	if #Inventory.AnimationObjects == 0 then
+		print("  (Nenhum Animator/Animation/ViewportFrame relevante encontrado)")
+	else
+		for _, anim in ipairs(Inventory.AnimationObjects) do
+			print(string.format("[%s] %s (%s)%s", anim.className, anim.path, anim.uid, anim.extra))
+		end
+	end
+
+	-- 8. === ROLL TRACE ===
+	print("\n=== ROLL TRACE ===")
+	if #Inventory.LastRollTrace == 0 then
+		print("  (Nenhum Roll Trace capturado ainda. Clique em [CAPTURE ROLL] e abra uma Star!)")
+	else
+		for _, tLine in ipairs(Inventory.LastRollTrace) do
+			print("\n" .. tLine)
+		end
+	end
+
+	-- 9. === TOP CANDIDATES ===
+	print("\n=== TOP CANDIDATES ===")
+	print("===== TOP CANDIDATES =====")
+	local sortedCandidates = {}
+	for _, rec in pairs(CandidateRegistry) do
+		table.insert(sortedCandidates, rec)
+	end
+	table.sort(sortedCandidates, function(a, b)
+		return a.score > b.score
+	end)
+
+	if #sortedCandidates == 0 then
+		print("  (Sem candidatos pontuados até o momento)")
+	else
+		for i = 1, math.min(25, #sortedCandidates) do
+			local c = sortedCandidates[i]
+			local reasonList = {}
+			for r in pairs(c.reasons) do
+				table.insert(reasonList, r)
+			end
+			table.sort(reasonList)
+			print(string.format(
+				"#%02d [Score: %d | Eventos Runtime: %d] [%s] %s\n    Evidências: %s",
+				i, c.score, c.changeCount, c.className, c.path, table.concat(reasonList, " + ")
+			))
+		end
+	end
+	print("======================================================================\n")
+end
+
+-- Expõe globalmente caso queira chamar pelo console/executor
+pcall(function()
+	(_G :: any).printFullReport = printFullReport
+end)
+
+-- ============================================================================
+-- INTERFACE GRÁFICA DO INSPECTOR
+-- ============================================================================
+local function createInspectorUI()
 	local parentGui = PlayerGui
 	pcall(function()
-		for _, oldName in ipairs({"StarTimingDiagnosticUI", "StarSpeedProfilerUI"}) do
+		for _, oldName in ipairs({ INSPECTOR_GUI_NAME, "StarTimingDiagnosticUI", "StarSpeedProfilerUI" }) do
 			if CoreGui:FindFirstChild(oldName) then
 				CoreGui[oldName]:Destroy()
 			end
 		end
 		parentGui = CoreGui
 	end)
-	if PlayerGui:FindFirstChild("StarTimingDiagnosticUI") then
-		PlayerGui.StarTimingDiagnosticUI:Destroy()
+	if PlayerGui:FindFirstChild(INSPECTOR_GUI_NAME) then
+		PlayerGui[INSPECTOR_GUI_NAME]:Destroy()
 	end
 
 	local screenGui = Instance.new("ScreenGui")
-	screenGui.Name = "StarTimingDiagnosticUI"
+	screenGui.Name = INSPECTOR_GUI_NAME
 	screenGui.ResetOnSpawn = false
 	screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 	screenGui.Parent = parentGui
 
 	local mainFrame = Instance.new("Frame")
 	mainFrame.Name = "MainFrame"
-	mainFrame.Size = UDim2.new(0, 345, 0, 415)
-	mainFrame.Position = UDim2.new(0.02, 0, 0.24, 0)
+	mainFrame.Size = UDim2.new(0, 355, 0, 395)
+	mainFrame.Position = UDim2.new(0.02, 0, 0.22, 0)
 	mainFrame.BackgroundColor3 = Color3.fromRGB(18, 20, 26)
 	mainFrame.BorderSizePixel = 0
 	mainFrame.Parent = screenGui
@@ -997,13 +1120,13 @@ local function createUI()
 	corner.Parent = mainFrame
 
 	local stroke = Instance.new("UIStroke")
-	stroke.Color = Color3.fromRGB(75, 90, 125)
+	stroke.Color = Color3.fromRGB(80, 100, 140)
 	stroke.Thickness = 1.5
 	stroke.Parent = mainFrame
 
 	local titleBar = Instance.new("Frame")
 	titleBar.Size = UDim2.new(1, 0, 0, 30)
-	titleBar.BackgroundColor3 = Color3.fromRGB(28, 32, 44)
+	titleBar.BackgroundColor3 = Color3.fromRGB(28, 34, 46)
 	titleBar.BorderSizePixel = 0
 	titleBar.Parent = mainFrame
 
@@ -1016,9 +1139,9 @@ local function createUI()
 	titleLabel.Position = UDim2.new(0, 10, 0, 0)
 	titleLabel.BackgroundTransparency = 1
 	titleLabel.Font = Enum.Font.GothamBold
-	titleLabel.Text = "STAR TIMING DIAGNOSTIC v5"
+	titleLabel.Text = "ANIME LEGACY GACHA INSPECTOR"
 	titleLabel.TextColor3 = Color3.fromRGB(240, 245, 255)
-	titleLabel.TextSize = 13
+	titleLabel.TextSize = 12
 	titleLabel.TextXAlignment = Enum.TextXAlignment.Left
 	titleLabel.Parent = titleBar
 
@@ -1032,17 +1155,17 @@ local function createUI()
 	closeBtn.TextSize = 14
 	closeBtn.Parent = titleBar
 
-	local statsLabel = Instance.new("TextLabel")
-	statsLabel.Position = UDim2.new(0, 12, 0, 36)
-	statsLabel.Size = UDim2.new(1, -24, 0, 290)
-	statsLabel.BackgroundTransparency = 1
-	statsLabel.Font = Enum.Font.RobotoMono
-	statsLabel.TextColor3 = Color3.fromRGB(225, 230, 240)
-	statsLabel.TextSize = 12
-	statsLabel.TextXAlignment = Enum.TextXAlignment.Left
-	statsLabel.TextYAlignment = Enum.TextYAlignment.Top
-	statsLabel.RichText = true
-	statsLabel.Parent = mainFrame
+	local statusLabel = Instance.new("TextLabel")
+	statusLabel.Position = UDim2.new(0, 12, 0, 36)
+	statusLabel.Size = UDim2.new(1, -24, 0, 200)
+	statusLabel.BackgroundTransparency = 1
+	statusLabel.Font = Enum.Font.RobotoMono
+	statusLabel.TextColor3 = Color3.fromRGB(225, 230, 240)
+	statusLabel.TextSize = 12
+	statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+	statusLabel.TextYAlignment = Enum.TextYAlignment.Top
+	statusLabel.RichText = true
+	statusLabel.Parent = mainFrame
 
 	local function makeButton(text: string, pos: UDim2, size: UDim2, color: Color3): TextButton
 		local btn = Instance.new("TextButton")
@@ -1062,13 +1185,55 @@ local function createUI()
 		return btn
 	end
 
-	local startBtn   = makeButton("[START]",      UDim2.new(0, 10, 0, 334),  UDim2.new(0, 104, 0, 32), Color3.fromRGB(40, 140, 75))
-	local stopBtn    = makeButton("[STOP]",       UDim2.new(0, 120, 0, 334), UDim2.new(0, 104, 0, 32), Color3.fromRGB(175, 55, 55))
-	local resetBtn   = makeButton("[RESET]",      UDim2.new(0, 230, 0, 334), UDim2.new(0, 104, 0, 32), Color3.fromRGB(70, 80, 100))
-	local recalibBtn = makeButton("RECALIBRAR",   UDim2.new(0, 10, 0, 374),  UDim2.new(0, 157, 0, 30), Color3.fromRGB(55, 95, 160))
-	local debugBtn   = makeButton("DEBUG F9: ON", UDim2.new(0, 177, 0, 374), UDim2.new(0, 157, 0, 30), Color3.fromRGB(110, 80, 150))
+	-- Linha 1: [CAPTURE ROLL] (3 segundos)
+	local captureRollBtn = makeButton("[CAPTURE ROLL (3.0s)]", UDim2.new(0, 10, 0, 242), UDim2.new(1, -20, 0, 32), Color3.fromRGB(40, 140, 80))
 
-	-- Dragging da janela
+	-- Linha 2: Modo Diff ([SNAPSHOT A], [SNAPSHOT B], [COMPARE])
+	local snapABtn   = makeButton("[SNAPSHOT A]", UDim2.new(0, 10, 0, 280),  UDim2.new(0, 106, 0, 30), Color3.fromRGB(55, 95, 160))
+	local snapBBtn   = makeButton("[SNAPSHOT B]", UDim2.new(0, 124, 0, 280), UDim2.new(0, 106, 0, 30), Color3.fromRGB(55, 95, 160))
+	local compareBtn = makeButton("[COMPARE]",    UDim2.new(0, 238, 0, 280), UDim2.new(0, 107, 0, 30), Color3.fromRGB(165, 105, 45))
+
+	-- Linha 3: Dumps específicos (UI Trees / Remotes & States)
+	local dumpUiBtn  = makeButton("DUMP UI TREES", UDim2.new(0, 10, 0, 316),  UDim2.new(0, 162, 0, 30), Color3.fromRGB(70, 80, 105))
+	local rescanBtn  = makeButton("RESCAN INVENTORY", UDim2.new(0, 183, 0, 316), UDim2.new(0, 162, 0, 30), Color3.fromRGB(70, 80, 105))
+
+	-- Linha 4: Relatório Completo printFullReport()
+	local fullRepBtn = makeButton("[PRINT FULL REPORT (F9)]", UDim2.new(0, 10, 0, 352), UDim2.new(1, -20, 0, 32), Color3.fromRGB(115, 75, 165))
+
+	local function refreshStatusText(extraBanner: string?)
+		local starFrame, rollingGui, starAnimGui = getTargetUiRoots()
+		local pityLabel = starFrame and starFrame:FindFirstChild("Pity") and starFrame.Pity:FindFirstChild("Value")
+		local pityStr = (pityLabel and pityLabel:IsA("TextLabel")) and pityLabel.Text or "N/A"
+
+		local snapAStatus = Inventory.SnapshotA and "OK" or "Vazio"
+		local snapBStatus = Inventory.SnapshotB and "OK" or "Vazio"
+
+		statusLabel.Text = string.format(
+			"STATUS: <b>%s</b>\n" ..
+			"PITY ATUAL: %s\n\n" ..
+			"SCRIPTS: %d | MODULES: %d (Cand: %d)\n" ..
+			"REMOTES: %d | STATES: %d\n" ..
+			"ANIM OBJECTS: %d\n\n" ..
+			"UI ROOTS DETECTADAS:\n" ..
+			"  Frames.Star:   %s\n" ..
+			"  Rolling:       %s\n" ..
+			"  StarAnimation: %s\n\n" ..
+			"ROLL TRACE EVENTS: %d\n" ..
+			"SNAPSHOT A: %s | SNAPSHOT B: %s",
+			extraBanner or (Inventory.IsCapturingRoll and '<font color="#ffaa00">CAPTURANDO ROLL (3.0s)...</font>' or '<font color="#55ff7f">PRONTO (READ-ONLY)</font>'),
+			pityStr,
+			#Inventory.Scripts, #Inventory.Modules, #Inventory.ScriptCandidates,
+			#Inventory.Remotes, #Inventory.States,
+			#Inventory.AnimationObjects,
+			starFrame and "SIM" or "NÃO",
+			rollingGui and "SIM" or "NÃO",
+			starAnimGui and "SIM" or "NÃO",
+			#Inventory.LastRollTrace,
+			snapAStatus, snapBStatus
+		)
+	end
+
+	-- Dragging
 	local dragging, dragInput, dragStart, startPos
 	titleBar.InputBegan:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
@@ -1087,7 +1252,7 @@ local function createUI()
 			dragInput = input
 		end
 	end)
-	local dragConn = UserInputService.InputChanged:Connect(function(input)
+	table.insert(Connections, UserInputService.InputChanged:Connect(function(input)
 		if input == dragInput and dragging then
 			local delta = input.Position - dragStart
 			mainFrame.Position = UDim2.new(
@@ -1095,105 +1260,67 @@ local function createUI()
 				startPos.Y.Scale, startPos.Y.Offset + delta.Y
 			)
 		end
+	end))
+
+	-- Ações dos Botões
+	captureRollBtn.MouseButton1Click:Connect(function()
+		refreshStatusText('<font color="#ffaa00">CAPTURANDO ROLL (3.0s)...</font>')
+		runRollCapture(function()
+			refreshStatusText('<font color="#55ff7f">ROLL TRACE CONCLUÍDO (F9)</font>')
+		end)
 	end)
 
-	startBtn.MouseButton1Click:Connect(function()
-		State.IsRunning = true
-		print("[STAR DIAGNOSTIC v5] Coleta INICIADA.")
+	snapABtn.MouseButton1Click:Connect(function()
+		Inventory.SnapshotA = takeStateSnapshot("SNAPSHOT A")
+		refreshStatusText('<font color="#55aaff">SNAPSHOT A SALVO</font>')
 	end)
 
-	stopBtn.MouseButton1Click:Connect(function()
-		State.IsRunning = false
-		printFinalReport()
+	snapBBtn.MouseButton1Click:Connect(function()
+		Inventory.SnapshotB = takeStateSnapshot("SNAPSHOT B")
+		refreshStatusText('<font color="#55aaff">SNAPSHOT B SALVO</font>')
 	end)
 
-	resetBtn.MouseButton1Click:Connect(function()
-		State.IsRunning = false
-		State.RawMouseClicks = 0
-		State.PhysicalMaxClicks = 0
-		State.ButtonEventsCount = 0
-		State.GroupedButtonMaxClicks = 0
-		State.ButtonActivatedCount = 0
-		State.RealOpenings = 0
-		State.RealRolls = 0
-		State.LastPhysicalMaxClickTime = nil
-		State.LastGroupedBtnEventTime = nil
-		State.LastPityTime = nil
-		State.MinClickToClick = math.huge
-		State.MinPityToPity = math.huge
-		State.LastClickToPity = 0
-		State.LastPityToPity = 0
-		State.MaxButtonReplacements = 0
-		State.BlockedOverlayClicks = 0
-		State.BestGateCandidate = "NENHUM"
-		table.clear(State.ClickIntervals)
-		table.clear(State.ButtonClickIntervals)
-		table.clear(State.PityIntervals)
-		table.clear(State.CycleRawMaxClicks)
-		table.clear(State.CycleButtonActivated)
-		table.clear(State.CycleButtonEvents)
-		table.clear(State.CycleFlags)
-		table.clear(State.GateCandidates)
-		print("[STAR DIAGNOSTIC v5] Todos os contadores foram resetados.")
+	compareBtn.MouseButton1Click:Connect(function()
+		compareSnapshots()
+		refreshStatusText('<font color="#ffaa55">DIFF A/B IMPRESSO NO F9</font>')
 	end)
 
-	recalibBtn.MouseButton1Click:Connect(function()
-		scanAndConnectAll()
+	dumpUiBtn.MouseButton1Click:Connect(function()
+		local starFrame, rollingGui, starAnimGui = getTargetUiRoots()
+		print("\n=== STAR UI TREE ===")
+		for _, l in ipairs(dumpUiTree(starFrame, "PlayerGui.UI.Frames.Star")) do print(l) end
+		print("\n=== ROLLING UI TREE ===")
+		for _, l in ipairs(dumpUiTree(rollingGui, "PlayerGui.Rolling")) do print(l) end
+		for _, l in ipairs(dumpUiTree(starAnimGui, "PlayerGui.StarAnimation")) do print(l) end
+		refreshStatusText('<font color="#55ff7f">UI TREES IMPRESSAS NO F9</font>')
 	end)
 
-	debugBtn.MouseButton1Click:Connect(function()
-		DEBUG = not DEBUG
-		debugBtn.Text = DEBUG and "DEBUG F9: ON" or "DEBUG F9: OFF"
-		debugBtn.BackgroundColor3 = DEBUG and Color3.fromRGB(110, 80, 150) or Color3.fromRGB(60, 60, 70)
+	rescanBtn.MouseButton1Click:Connect(function()
+		scanAllStaticInventories()
+		refreshStatusText('<font color="#55ff7f">INVENTÁRIO ATUALIZADO</font>')
 	end)
 
-	local renderConn
-	renderConn = RunService.RenderStepped:Connect(function()
-		local clicksPerOpen = (State.RealOpenings > 0) and (State.PhysicalMaxClicks / State.RealOpenings) or 0
-		local minClick = (State.MinClickToClick == math.huge) and 0 or State.MinClickToClick
-		local minPity = (State.MinPityToPity == math.huge) and 0 or State.MinPityToPity
-		local verdictTitle, _ = classifyFinalBehavior()
-
-		statsLabel.Text = string.format(
-			"STATUS: %s\n\n" ..
-			"RAW CLICKS: %d\n" ..
-			"MAX CLICKS: %d (Btn Hit: %d)\n" ..
-			"BUTTON EVENTS: %d\n\n" ..
-			"ABERTURAS REAIS: %d\n" ..
-			"ROLLS REAIS: %d\n\n" ..
-			"CLIQUES / ABERTURA: %.1f\n\n" ..
-			"MENOR CLICK -> CLICK: %.3fs\n" ..
-			"MENOR PITY -> PITY: %.3fs\n\n" ..
-			"ÚLTIMO CLICK -> PITY: %.3fs\n\n" ..
-			"POSSÍVEL GATE:\n<b>%s</b>\n" ..
-			"DIAG: <b>%s</b>",
-			State.IsRunning and '<font color="#55ff7f">RODANDO</font>' or '<font color="#ffaa55">PARADO</font>',
-			State.RawMouseClicks,
-			State.PhysicalMaxClicks, State.GroupedButtonMaxClicks,
-			State.ButtonEventsCount,
-			State.RealOpenings,
-			State.RealRolls,
-			clicksPerOpen,
-			minClick,
-			minPity,
-			State.LastClickToPity,
-			State.BestGateCandidate,
-			verdictTitle
-		)
+	fullRepBtn.MouseButton1Click:Connect(function()
+		printFullReport()
+		refreshStatusText('<font color="#55ff7f">FULL REPORT IMPRESSO NO F9</font>')
 	end)
 
 	closeBtn.MouseButton1Click:Connect(function()
-		State.IsRunning = false
-		if renderConn then renderConn:Disconnect() end
-		if dragConn then dragConn:Disconnect() end
-		clearConnections()
+		stopRollCaptureConnections()
+		for _, c in ipairs(Connections) do
+			if c.Connected then c:Disconnect() end
+		end
+		table.clear(Connections)
 		screenGui:Destroy()
-		print("[STAR DIAGNOSTIC v5] Encerrado e todas as conexões foram limpas.")
+		print("[INSPECTOR] Encerrado e todas as conexões foram limpas.")
 	end)
+
+	scanAllStaticInventories()
+	refreshStatusText()
 end
 
 -- ============================================================================
 -- INICIALIZAÇÃO
 -- ============================================================================
-createUI()
-scanAndConnectAll()
+createInspectorUI()
+print("[ANIME LEGACY INSPECTOR] Carregado! Use os botões da UI ou chame _G.printFullReport() para gerar o relatório completo.")

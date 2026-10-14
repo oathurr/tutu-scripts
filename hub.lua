@@ -1,8 +1,8 @@
 --[[
-    STAR SPEED PROFILER & GACHA DIAGNOSTIC (READ-ONLY)
+    STAR BATCH PROFILER v2 (READ-ONLY)
     Jogo alvo: Anime Legacy Simulator
-    Objetivo: Medir com alta precisão (os.clock) a cadência real de abertura de Stars
-              e descobrir os sinais mais confiáveis na UI/Dados do cliente.
+    Objetivo: Medir exclusivamente os CICLOS DE ABERTURA (Batches) e o intervalo exato
+              permitido entre o início de uma abertura e a próxima.
 ]]
 
 local Players = game:GetService("Players")
@@ -16,34 +16,66 @@ local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 -- ============================================================================
 -- CONFIGURAÇÕES PRINCIPAIS
 -- ============================================================================
-local DEBUG = true -- Imprime mudanças detectadas no console (F9)
-local DEDUP_WINDOW = 0.15 -- Janela (em segundos) para agrupar sinais do MESMO giro
+local DEBUG = true
 
--- Se após o primeiro teste você descobrir o caminho exato (ex: "PlayerGui.Main.Star.Pity"),
--- você pode preenchê-lo abaixo para ignorar outros sinais. Deixe nil para detecção automática.
-local LOCKED_SIGNAL_PATH: string? = nil
+-- Janela de deduplicação (em segundos). Como a abertura normal leva ~1.27s,
+-- 0.45s garante que sinais atrasados da mesma abertura sejam ignorados sem bloquear o próximo ciclo.
+local DEDUP_WINDOW = 0.45
 
--- Palavras-chave para filtrar apenas objetos relacionados ao Gacha/Stars
+-- Quando true, o profiler trava automaticamente no sinal mais confiável de início de abertura
+-- (priorizando Pity > Atributo > ScreenGui/Frame raiz) para medir sempre o mesmo ponto do ciclo.
+local AUTO_ANCHOR = true
+
+-- Caso queira travar manualmente em um caminho específico visto no F9, coloque a string aqui:
+local MANUAL_LOCKED_PATH: string? = nil
+
+-- Controle de quais sinais podem contar uma ABERTURA (true) vs APENAS DEBUG (false)
+local SIGNAL_CONFIG = {
+	-- Sinais primários (acontecem 1 vez no início do ciclo)
+	Pity = true,
+	AttrCounter = true,
+	ScreenGuiEnabled = true,
+	GuiVisible = true,
+
+	-- Sinais secundários (APENAS DEBUG - nunca aumentam a contagem de aberturas)
+	ChildAdded = false,
+	ImageChange = false,
+	TextChange = false,
+	Currency = false,
+}
+
+-- Prioridade dos sinais para o AUTO_ANCHOR (quanto maior, mais confiável como início de ciclo)
+local SIGNAL_PRIORITY: {[string]: number} = {
+	Pity = 4,
+	AttrCounter = 3,
+	ScreenGuiEnabled = 2,
+	GuiVisible = 1,
+}
+
 local GACHA_KEYWORDS = {
 	"star", "summon", "roll", "open", "hatch", "gacha",
 	"pity", "result", "unit", "character", "capsule", "banner", "pull"
 }
 
--- Palavras-chave ignoradas para evitar falsos positivos (timers de banner, FPS, chat, etc.)
 local IGNORE_KEYWORDS = {
 	"timer", "cooldown", "fps", "ping", "clock", "timeleft",
 	"refresh", "reset", "chat", "bubble", "health", "xp", "quest", "index"
 }
 
+-- Evita que sub-elementos de cartas/slots acionem GuiVisible como se fossem a janela principal
+local CARD_SUBELEMENT_KEYWORDS = {
+	"template", "card", "slot", "grid", "viewport", "icon", "rarity", "shiny"
+}
+
 -- ============================================================================
 -- ESTADO DO TESTE E HISTÓRICO
 -- ============================================================================
-export type RollEntry = {
-	roll: number,
+export type OpeningEntry = {
+	opening: number,
 	timestamp: number,
 	interval: number?,
-	batchSize: number,
-	source: string
+	source: string,
+	signalType: string,
 }
 
 local State = {
@@ -51,25 +83,22 @@ local State = {
 	StartTime = 0,
 	ElapsedTime = 0,
 
-	TotalRolls = 0,          -- Total de Stars abertas (conta x3/x10)
-	TotalBatches = 0,        -- Total de cliques/ciclos de abertura
-	LastRollTimestamp = nil :: number?,
+	TotalOpenings = 0,
+	LastOpeningTimestamp = nil :: number?,
 
-	-- Controle de Deduplicação e Multi-Roll dentro da mesma janela
-	CurrentBatchTimestamp = 0,
-	CurrentBatchCount = 0,
-	CurrentBatchSpawnedCards = 0,
+	-- Âncora automática para garantir medição do mesmo evento a cada ciclo
+	AnchorPath = nil :: string?,
+	AnchorType = nil :: string?,
+	AnchorPriority = 0,
 
 	MinInterval = math.huge,
 	MaxInterval = 0,
 	LastInterval = 0,
-	LastSignalPath = "Nenhum",
 
 	Intervals = {} :: {number},
-	RollHistory = {} :: {RollEntry},
+	OpeningHistory = {} :: {OpeningEntry},
 }
 
--- Armazenamento de conexões para evitar Memory Leak
 local Connections = {} :: {RBXScriptConnection}
 local WatchedInstances = {} :: {[Instance]: boolean}
 
@@ -106,14 +135,12 @@ local function isRelevantPath(path: string): boolean
 	return containsKeyword(path, GACHA_KEYWORDS)
 end
 
--- Ignora textos que são apenas relógios/contadores de tempo (ex: "14:59", "5m 30s")
 local function looksLikeTimerText(text: string): boolean
 	if string.match(text, "^%d+:%d+") then return true end
 	if string.match(string.lower(text), "%d+%s*[hms]%s+%d+%s*[hms]") then return true end
 	return false
 end
 
--- Tenta extrair valores de Pity em textos como "34/100", "Pity: 20 / 50", etc.
 local function parsePityText(text: string): (number?, number?)
 	local cur, max = string.match(text, "(%d+)%s*/%s*(%d+)")
 	if cur and max then
@@ -128,58 +155,84 @@ local function parsePityText(text: string): (number?, number?)
 	return nil, nil
 end
 
-local function debugLog(category: string, path: string, details: string)
+local function debugPrint(signalType: string, path: string, details: string, isTrigger: boolean)
 	if not DEBUG then return end
-	print(string.format("[DEBUG] %s:\n%s\n%s", category, path, details))
+	local now = os.clock()
+	local relTimeStr = ""
+	if State.LastOpeningTimestamp then
+		relTimeStr = string.format(" (+%.3fs após última abertura)", now - State.LastOpeningTimestamp)
+	end
+	local tag = isTrigger and "[TRIGGER DE ABERTURA]" or "[DEBUG - IGNORADO NA CONTAGEM]"
+	print(string.format("%s [%s]%s\nCaminho: %s\n%s", tag, signalType, relTimeStr, path, details))
 end
 
 -- ============================================================================
--- NÚCLEO DE REGISTRO DE GIROS E DEDUPLICAÇÃO
+-- NÚCLEO DE DETECÇÃO DE ABERTURA (1 CICLO = 1 ABERTURA)
 -- ============================================================================
-local function registerRollSignal(sourcePath: string, detectedRollCount: number?, signalType: string)
-	if LOCKED_SIGNAL_PATH and sourcePath ~= LOCKED_SIGNAL_PATH then
+local function handleSignal(signalType: string, sourcePath: string, details: string)
+	local canTrigger = SIGNAL_CONFIG[signalType] == true
+
+	-- 1. Se for ChildAdded, ImageChange, TextChange ou Currency, apenas imprime no DEBUG e sai
+	if not canTrigger then
+		debugPrint(signalType, sourcePath, details, false)
+		return
+	end
+
+	-- 2. Verifica filtro manual, se configurado
+	if MANUAL_LOCKED_PATH and sourcePath ~= MANUAL_LOCKED_PATH then
+		debugPrint(signalType, sourcePath, details .. " (Ignorado por MANUAL_LOCKED_PATH)", false)
 		return
 	end
 
 	local now = os.clock()
-	local rollsToAdd = math.max(1, detectedRollCount or 1)
-	State.LastSignalPath = string.format("[%s] %s", signalType, sourcePath)
+	local priority = SIGNAL_PRIORITY[signalType] or 1
 
-	-- Só contabiliza nas métricas se o cronômetro tiver sido iniciado no [START]
-	if not State.IsRunning then
-		return
-	end
-
-	local timeSinceCurrentBatch = now - State.CurrentBatchTimestamp
-
-	-- CASO 1: Estamos DENTRO da janela de deduplicação (DEDUP_WINDOW)
-	-- Isso significa que múltiplos elementos da UI mudaram juntos no mesmo giro.
-	if State.CurrentBatchTimestamp > 0 and timeSinceCurrentBatch <= DEDUP_WINDOW then
-		-- Se um sinal mais preciso (como Pity ou múltiplos cards criados) indicar que foi
-		-- um Multi-Roll (ex: x3 ou x10) maior do que o registrado no primeiro milissegundo,
-		-- atualizamos apenas a diferença de Stars abertas sem criar um intervalo falso!
-		if rollsToAdd > State.CurrentBatchCount then
-			local diff = rollsToAdd - State.CurrentBatchCount
-			State.CurrentBatchCount = rollsToAdd
-
-			for _ = 1, diff do
-				State.TotalRolls += 1
-				table.insert(State.RollHistory, {
-					roll = State.TotalRolls,
-					timestamp = State.CurrentBatchTimestamp,
-					interval = nil, -- Parte do mesmo pacote multi-roll
-					batchSize = rollsToAdd,
-					source = sourcePath
-				})
-			end
+	-- 3. Verifica se estamos dentro da janela de deduplicação da abertura atual
+	if State.LastOpeningTimestamp and (now - State.LastOpeningTimestamp) <= DEDUP_WINDOW then
+		-- Se um sinal de prioridade MAIOR (ex: Pity) disparar poucos milissegundos após
+		-- um GuiVisible no primeiro giro, promovemos o Pity para ser a Âncora oficial
+		-- sem somar uma nova abertura!
+		if AUTO_ANCHOR and not MANUAL_LOCKED_PATH and priority > State.AnchorPriority then
+			State.AnchorPath = sourcePath
+			State.AnchorType = signalType
+			State.AnchorPriority = priority
+			debugPrint(signalType, sourcePath, details .. " -> [PROMOVIDO A SINAL ÂNCORA]", true)
+		else
+			debugPrint(signalType, sourcePath, details .. " (Deduplicado dentro da janela)", false)
 		end
 		return
 	end
 
-	-- CASO 2: NOVO GIRO DETECTADO (Fora da janela de deduplicação)
+	-- 4. Lógica de Sinal Âncora (garante que apenas 1 único objeto marque os ciclos)
+	if AUTO_ANCHOR and not MANUAL_LOCKED_PATH then
+		if State.AnchorPath == nil then
+			State.AnchorPath = sourcePath
+			State.AnchorType = signalType
+			State.AnchorPriority = priority
+		elseif sourcePath ~= State.AnchorPath then
+			-- Se aparecer um sinal de prioridade mais alta (ex: Pity), assume a âncora;
+			-- caso contrário, ignora sinais paralelos fora de hora.
+			if priority > State.AnchorPriority then
+				State.AnchorPath = sourcePath
+				State.AnchorType = signalType
+				State.AnchorPriority = priority
+			else
+				debugPrint(signalType, sourcePath, details .. " (Ignorado: diferente do Sinal Âncora)", false)
+				return
+			end
+		end
+	end
+
+	debugPrint(signalType, sourcePath, details, true)
+
+	-- Só registra nas métricas se o botão [START] estiver ativo
+	if not State.IsRunning then
+		return
+	end
+
 	local interval: number? = nil
-	if State.LastRollTimestamp ~= nil then
-		interval = now - State.LastRollTimestamp
+	if State.LastOpeningTimestamp ~= nil then
+		interval = now - State.LastOpeningTimestamp
 		State.LastInterval = interval
 		table.insert(State.Intervals, interval)
 
@@ -191,29 +244,23 @@ local function registerRollSignal(sourcePath: string, detectedRollCount: number?
 		end
 	end
 
-	State.LastRollTimestamp = now
-	State.CurrentBatchTimestamp = now
-	State.CurrentBatchCount = rollsToAdd
-	State.CurrentBatchSpawnedCards = 0
-	State.TotalBatches += 1
+	State.LastOpeningTimestamp = now
+	State.TotalOpenings += 1
 
-	for i = 1, rollsToAdd do
-		State.TotalRolls += 1
-		table.insert(State.RollHistory, {
-			roll = State.TotalRolls,
-			timestamp = now,
-			interval = (i == 1) and interval or nil, -- Registra o intervalo real na abertura do lote
-			batchSize = rollsToAdd,
-			source = sourcePath
-		})
-	end
+	table.insert(State.OpeningHistory, {
+		opening = State.TotalOpenings,
+		timestamp = now,
+		interval = interval,
+		source = sourcePath,
+		signalType = signalType,
+	})
 end
 
 -- ============================================================================
--- DETECTORES HEURÍSTICOS (PASSIVOS)
+-- DETECTORES PASSIVOS
 -- ============================================================================
 
--- Detector 1 & 5: TextLabels (Pity, Nome de Personagem Obtido, Textos de Gacha)
+-- Detector de TextLabels: Separa Pity (Trigger Primário) de TextChange comum (Apenas Debug)
 local function watchTextLabel(label: TextLabel, path: string)
 	local lastText = label.Text
 	local isPityLabel = (parsePityText(lastText) ~= nil) or containsKeyword(path, {"pity"})
@@ -227,56 +274,27 @@ local function watchTextLabel(label: TextLabel, path: string)
 			return
 		end
 
-		local oldCur, oldMax = parsePityText(lastText)
-		local newCur, newMax = parsePityText(newText)
+		local oldCur, _ = parsePityText(lastText)
+		local newCur, _ = parsePityText(newText)
+		local prevStr = lastText
+		lastText = newText
 
-		-- Sinais de Pity têm altíssima confiabilidade e detectam Multi-Rolls (x3, x10)
-		if (oldCur and newCur) or isPityLabel then
-			local prevStr = lastText
-			lastText = newText
-
-			debugLog("TextLabel (Pity) mudou", path, string.format("Anterior: %s\nNovo: %s", prevStr, newText))
-
-			local delta = 1
-			if oldCur and newCur then
-				if newCur > oldCur then
-					delta = newCur - oldCur
-				elseif newCur < oldCur and oldMax and newCur > 0 then
-					-- Caso o Pity tenha resetado ao atingir o limite (ex: 99/100 -> 2/100 num x3)
-					local wrapped = (oldMax - oldCur) + newCur
-					if wrapped > 0 and wrapped <= 20 then
-						delta = wrapped
-					end
-				end
-			end
-			-- Limite de segurança para evitar leituras incorretas de outros números
-			if delta > 0 and delta <= 50 then
-				registerRollSignal(path, delta, "Pity")
-			end
+		-- Se for contador de Pity (ex: 20/100 -> 26/100), dispara APENAS 1 abertura
+		if (oldCur and newCur and oldCur ~= newCur) or isPityLabel then
+			handleSignal("Pity", path, string.format("Anterior: %s | Novo: %s", prevStr, newText))
 			return
 		end
 
-		-- Outros TextLabels relevantes (ex: nome do personagem recebido, raridade)
+		-- Demais textos relevantes ficam estritamente como TextChange (APENAS DEBUG)
 		if isPathRelevant then
-			local prevStr = lastText
-			lastText = newText
-			debugLog("TextLabel mudou", path, string.format("Anterior: %s\nNovo: %s", prevStr, newText))
-
-			-- Se for um texto dentro de área de Result/Summon/Unit, conta como sinal de giro
-			if containsKeyword(path, {"result", "unit", "character", "summon", "hatch", "open", "roll"}) then
-				registerRollSignal(path, 1, "TextChange")
-			end
-		else
-			lastText = newText
+			handleSignal("TextChange", path, string.format("Anterior: %s | Novo: %s", prevStr, newText))
 		end
 	end)
 
 	table.insert(Connections, conn)
 end
 
--- Detector 2: Moedas / Currencies (Leaderstats, pastas de dados e Atributos)
--- IMPORTANTE: Só dispara sinal de giro quando a moeda DIMINUI (compra da Star),
--- ignorando quando você ganha moedas derrotando inimigos.
+-- Detector de Moedas (Estritamente DEBUG nesta versão)
 local function watchValueObject(valObj: ValueBase, path: string)
 	if not (valObj:IsA("NumberValue") or valObj:IsA("IntValue")) then return end
 	if containsKeyword(path, IGNORE_KEYWORDS) then return end
@@ -290,16 +308,15 @@ local function watchValueObject(valObj: ValueBase, path: string)
 		local prevVal = lastVal
 		lastVal = newVal
 
-		-- Se a moeda diminuiu, é um forte indicativo de compra de Star/Gacha
 		if diff < 0 then
-			debugLog("Currency mudou (Gasto detectado)", path, string.format("%s -> %s (Delta: %s)", tostring(prevVal), tostring(newVal), tostring(diff)))
-			registerRollSignal(path, 1, "CurrencySpend")
+			handleSignal("Currency", path, string.format("%s -> %s (Delta: %s)", tostring(prevVal), tostring(newVal), tostring(diff)))
 		end
 	end)
 
 	table.insert(Connections, conn)
 end
 
+-- Detector de Atributos do LocalPlayer
 local function watchPlayerAttributes()
 	local lastAttrs = LocalPlayer:GetAttributes()
 
@@ -311,13 +328,10 @@ local function watchPlayerAttributes()
 		local attrPath = "LocalPlayer.Attribute." .. attrName
 
 		if typeof(newVal) == "number" and typeof(oldVal) == "number" then
-			if containsKeyword(attrName, {"pity", "roll", "star", "summon", "hatch"}) and newVal > oldVal then
-				local delta = math.clamp(math.floor(newVal - oldVal), 1, 50)
-				debugLog("Attribute (Pity/Counter) mudou", attrPath, string.format("%s -> %s", tostring(oldVal), tostring(newVal)))
-				registerRollSignal(attrPath, delta, "AttrCounter")
+			if containsKeyword(attrName, {"pity", "roll", "star", "summon", "hatch", "open"}) and newVal > oldVal then
+				handleSignal("AttrCounter", attrPath, string.format("%s -> %s", tostring(oldVal), tostring(newVal)))
 			elseif newVal < oldVal and not containsKeyword(attrName, IGNORE_KEYWORDS) then
-				debugLog("Currency/Attribute diminuiu", attrPath, string.format("%s -> %s", tostring(oldVal), tostring(newVal)))
-				registerRollSignal(attrPath, 1, "AttrSpend")
+				handleSignal("Currency", attrPath, string.format("%s -> %s", tostring(oldVal), tostring(newVal)))
 			end
 		end
 	end)
@@ -325,7 +339,7 @@ local function watchPlayerAttributes()
 	table.insert(Connections, conn)
 end
 
--- Detector 3, 4 & 5: Visibilidade de Frames, Imagens e Criação de Cards de Resultado
+-- Detector de Objetos de GUI
 local function watchGuiObject(guiObj: Instance, path: string)
 	if WatchedInstances[guiObj] then return end
 	WatchedInstances[guiObj] = true
@@ -336,58 +350,53 @@ local function watchGuiObject(guiObj: Instance, path: string)
 
 	if not isRelevantPath(path) then return end
 
-	-- Detector 3: Aparecimento de GUI (Visible / Enabled)
-	if guiObj:IsA("GuiObject") then
-		local conn = guiObj:GetPropertyChangedSignal("Visible"):Connect(function()
-			if guiObj.Visible then
-				debugLog("GUI ficou visível", path, "Visible = true")
-				if containsKeyword(path, {"result", "summon", "roll", "hatch", "open", "star", "unit"}) then
-					registerRollSignal(path, 1, "GuiVisible")
-				end
+	-- ScreenGui ativada (Início de Abertura)
+	if guiObj:IsA("ScreenGui") then
+		local conn = guiObj:GetPropertyChangedSignal("Enabled"):Connect(function()
+			if guiObj.Enabled then
+				handleSignal("ScreenGuiEnabled", path, "Enabled = true")
 			end
 		end)
 		table.insert(Connections, conn)
-	elseif guiObj:IsA("ScreenGui") then
-		local conn = guiObj:GetPropertyChangedSignal("Enabled"):Connect(function()
-			if guiObj.Enabled then
-				debugLog("ScreenGui ativada", path, "Enabled = true")
-				registerRollSignal(path, 1, "ScreenGuiEnabled")
+
+	-- Frame/GuiObject ficando visível
+	elseif guiObj:IsA("GuiObject") then
+		local conn = guiObj:GetPropertyChangedSignal("Visible"):Connect(function()
+			if guiObj.Visible then
+				-- Se for um card/slot interno de personagem, trata apenas como DEBUG
+				if containsKeyword(path, CARD_SUBELEMENT_KEYWORDS) then
+					debugPrint("GuiVisibleSubElement", path, "Visible = true (Sub-elemento de carta)", false)
+				elseif containsKeyword(path, {"result", "summon", "roll", "hatch", "open", "star"}) then
+					handleSignal("GuiVisible", path, "Visible = true")
+				end
 			end
 		end)
 		table.insert(Connections, conn)
 	end
 
-	-- Detector 5: Mudança de Imagem de Personagem/Unidade
+	-- Mudança de Imagem (Estritamente DEBUG)
 	if guiObj:IsA("ImageLabel") and containsKeyword(path, {"result", "unit", "character", "icon", "viewport"}) then
 		local lastImg = guiObj.Image
 		local conn = guiObj:GetPropertyChangedSignal("Image"):Connect(function()
 			local newImg = guiObj.Image
 			if newImg ~= lastImg and newImg ~= "" then
-				debugLog("ImageLabel mudou", path, string.format("Anterior: %s\nNovo: %s", lastImg, newImg))
+				local prevImg = lastImg
 				lastImg = newImg
-				registerRollSignal(path, 1, "ImageChange")
+				handleSignal("ImageChange", path, string.format("Anterior: %s | Novo: %s", prevImg, newImg))
 			end
 		end)
 		table.insert(Connections, conn)
 	end
 
-	-- Detector 4: Criação dinâmica de Frames/Modelos nos containers de resultado (suporta x3 / x10)
+	-- ChildAdded (Estritamente DEBUG)
 	if guiObj:IsA("GuiObject") or guiObj:IsA("Folder") or guiObj:IsA("ScreenGui") then
 		local conn = guiObj.ChildAdded:Connect(function(child)
 			if child:IsA("UILayout") or child:IsA("UIConstraint") or child:IsA("UICorner") or child:IsA("UIStroke") then
 				return
 			end
 			local childPath = path .. "." .. child.Name
-			debugLog("GUI/Objeto criado (ChildAdded)", childPath, "Tipo: " .. child.ClassName)
-
 			if containsKeyword(childPath, {"result", "unit", "character", "card", "template", "star", "summon", "roll"}) then
-				local now = os.clock()
-				if (now - State.CurrentBatchTimestamp) <= DEDUP_WINDOW then
-					State.CurrentBatchSpawnedCards += 1
-				else
-					State.CurrentBatchSpawnedCards = 1
-				end
-				registerRollSignal(childPath, State.CurrentBatchSpawnedCards, "ChildAdded")
+				handleSignal("ChildAdded", childPath, "Classe: " .. child.ClassName)
 			end
 		end)
 		table.insert(Connections, conn)
@@ -395,7 +404,7 @@ local function watchGuiObject(guiObj: Instance, path: string)
 end
 
 -- ============================================================================
--- SISTEMA DE ESCANEAMENTO E RECALIBRAÇÃO
+-- ESCANEAMENTO E RECALIBRAÇÃO
 -- ============================================================================
 local function clearWatchers()
 	for _, conn in ipairs(Connections) do
@@ -410,18 +419,15 @@ end
 local function scanAndConnect()
 	clearWatchers()
 
-	-- 1. Monitora tudo dentro do PlayerGui atual e futuros elementos criados
 	for _, desc in ipairs(PlayerGui:GetDescendants()) do
 		watchGuiObject(desc, "PlayerGui." .. getCleanPath(desc))
 	end
 
 	local pgAddedConn = PlayerGui.DescendantAdded:Connect(function(desc)
-		local path = "PlayerGui." .. getCleanPath(desc)
-		watchGuiObject(desc, path)
+		watchGuiObject(desc, "PlayerGui." .. getCleanPath(desc))
 	end)
 	table.insert(Connections, pgAddedConn)
 
-	-- 2. Monitora ValueObjects no LocalPlayer (leaderstats, Data, Currencies, etc.)
 	for _, desc in ipairs(LocalPlayer:GetDescendants()) do
 		if desc:IsA("ValueBase") and not desc:IsDescendantOf(PlayerGui) then
 			watchValueObject(desc, "LocalPlayer." .. getCleanPath(desc))
@@ -435,11 +441,10 @@ local function scanAndConnect()
 	end)
 	table.insert(Connections, lpAddedConn)
 
-	-- 3. Monitora Atributos do LocalPlayer
 	watchPlayerAttributes()
 
 	if DEBUG then
-		print("[STAR PROFILER] Escaneamento concluído! Monitorando eventos do cliente passivamente.")
+		print("[STAR PROFILER v2] Monitorando ABERTURAS (ChildAdded/Text/Image/Currency = apenas DEBUG).")
 	end
 end
 
@@ -448,8 +453,8 @@ end
 -- ============================================================================
 local function getRollingWindowCounts(now: number): (number, number, number)
 	local c10, c30, c60 = 0, 0, 0
-	for i = #State.RollHistory, 1, -1 do
-		local entry = State.RollHistory[i]
+	for i = #State.OpeningHistory, 1, -1 do
+		local entry = State.OpeningHistory[i]
 		local age = now - entry.timestamp
 		if age <= 10 then
 			c10 += 1
@@ -461,7 +466,7 @@ local function getRollingWindowCounts(now: number): (number, number, number)
 		elseif age <= 60 then
 			c60 += 1
 		else
-			break -- Como o histórico é cronológico, podemos parar aqui (otimização O(1) média)
+			break
 		end
 	end
 	return c10, c30, c60
@@ -478,36 +483,36 @@ end
 
 local function printFinalReport()
 	local totalTime = State.ElapsedTime
-	local totalRolls = State.TotalRolls
-	local rpm = (totalTime > 0) and ((totalRolls / totalTime) * 60) or 0
+	local totalOpenings = State.TotalOpenings
+	local opm = (totalTime > 0) and ((totalOpenings / totalTime) * 60) or 0
 	local avgInterval = getAverageInterval()
 	local minInt = (State.MinInterval == math.huge) and 0 or State.MinInterval
 	local maxInt = State.MaxInterval
 
-	print("\n===== STAR SPEED TEST =====")
-	print(string.format("Tempo: %.2f segundos", totalTime))
-	print(string.format("Giros: %d (Ciclos/Aberturas: %d)", totalRolls, State.TotalBatches))
-	print(string.format("Giros/minuto: %.1f", rpm))
-	print(string.format("Tempo médio/giro: %.3fs", avgInterval))
+	print("\n===== STAR BATCH SPEED TEST (v2) =====")
+	print(string.format("Tempo total: %.2f segundos", totalTime))
+	print(string.format("Aberturas: %d", totalOpenings))
+	print(string.format("Aberturas/minuto: %.1f", opm))
+	print(string.format("Intervalo médio entre aberturas: %.3fs", avgInterval))
 	print(string.format("Menor intervalo: %.3fs", minInt))
 	print(string.format("Maior intervalo: %.3fs", maxInt))
-	print(string.format("Último sinal usado: %s", State.LastSignalPath))
+	print(string.format("Último intervalo: %.3fs", State.LastInterval))
+	print(string.format("Sinal Âncora usado: [%s] %s", tostring(State.AnchorType or "Nenhum"), tostring(State.AnchorPath or "Nenhum")))
 	print("\nPrimeiros 10 intervalos:")
 	if #State.Intervals == 0 then
 		print("  (Nenhum intervalo registrado)")
 	else
 		for i = 1, math.min(10, #State.Intervals) do
-			print(string.format("  %.3f", State.Intervals[i]))
+			print(string.format("  #%d: %.3fs", i, State.Intervals[i]))
 		end
 	end
-	print("===========================\n")
+	print("======================================\n")
 end
 
 -- ============================================================================
--- INTERFACE GRÁFICA (GUI COMPACTA E ARRASTÁVEL)
+-- INTERFACE GRÁFICA (GUI COMPACTA)
 -- ============================================================================
 local function createUI()
-	-- Remove UI anterior se já existir
 	local parentGui = PlayerGui
 	pcall(function()
 		if CoreGui:FindFirstChild("StarSpeedProfilerUI") then
@@ -527,7 +532,7 @@ local function createUI()
 
 	local mainFrame = Instance.new("Frame")
 	mainFrame.Name = "MainFrame"
-	mainFrame.Size = UDim2.new(0, 270, 0, 310)
+	mainFrame.Size = UDim2.new(0, 310, 0, 325)
 	mainFrame.Position = UDim2.new(0.02, 0, 0.3, 0)
 	mainFrame.BackgroundColor3 = Color3.fromRGB(20, 22, 28)
 	mainFrame.BorderSizePixel = 0
@@ -542,7 +547,6 @@ local function createUI()
 	stroke.Thickness = 1.5
 	stroke.Parent = mainFrame
 
-	-- Barra de Título
 	local titleBar = Instance.new("Frame")
 	titleBar.Size = UDim2.new(1, 0, 0, 30)
 	titleBar.BackgroundColor3 = Color3.fromRGB(30, 34, 44)
@@ -558,7 +562,7 @@ local function createUI()
 	titleLabel.Position = UDim2.new(0, 10, 0, 0)
 	titleLabel.BackgroundTransparency = 1
 	titleLabel.Font = Enum.Font.GothamBold
-	titleLabel.Text = "STAR SPEED PROFILER"
+	titleLabel.Text = "STAR BATCH PROFILER v2"
 	titleLabel.TextColor3 = Color3.fromRGB(240, 240, 255)
 	titleLabel.TextSize = 13
 	titleLabel.TextXAlignment = Enum.TextXAlignment.Left
@@ -574,20 +578,19 @@ local function createUI()
 	closeBtn.TextSize = 14
 	closeBtn.Parent = titleBar
 
-	-- Texto das Métricas
 	local statsLabel = Instance.new("TextLabel")
-	statsLabel.Position = UDim2.new(0, 12, 0, 38)
-	statsLabel.Size = UDim2.new(1, -24, 0, 175)
+	statsLabel.Position = UDim2.new(0, 12, 0, 36)
+	statsLabel.Size = UDim2.new(1, -24, 0, 195)
 	statsLabel.BackgroundTransparency = 1
 	statsLabel.Font = Enum.Font.RobotoMono
 	statsLabel.TextColor3 = Color3.fromRGB(220, 225, 235)
-	statsLabel.TextSize = 13
+	statsLabel.TextSize = 12
 	statsLabel.TextXAlignment = Enum.TextXAlignment.Left
 	statsLabel.TextYAlignment = Enum.TextYAlignment.Top
 	statsLabel.RichText = true
+	statsLabel.TextTruncate = Enum.TextTruncate.AtEnd
 	statsLabel.Parent = mainFrame
 
-	-- Criador de Botões
 	local function makeButton(text: string, pos: UDim2, size: UDim2, color: Color3): TextButton
 		local btn = Instance.new("TextButton")
 		btn.Size = size
@@ -606,14 +609,14 @@ local function createUI()
 		return btn
 	end
 
-	local startBtn = makeButton("[START]", UDim2.new(0, 10, 0, 225), UDim2.new(0, 80, 0, 32), Color3.fromRGB(40, 140, 75))
-	local stopBtn  = makeButton("[STOP]",  UDim2.new(0, 95, 0, 225), UDim2.new(0, 80, 0, 32), Color3.fromRGB(175, 55, 55))
-	local resetBtn = makeButton("[RESET]", UDim2.new(0, 180, 0, 225), UDim2.new(0, 80, 0, 32), Color3.fromRGB(70, 80, 100))
+	local startBtn = makeButton("[START]", UDim2.new(0, 10, 0, 240), UDim2.new(0, 92, 0, 32), Color3.fromRGB(40, 140, 75))
+	local stopBtn  = makeButton("[STOP]",  UDim2.new(0, 109, 0, 240), UDim2.new(0, 92, 0, 32), Color3.fromRGB(175, 55, 55))
+	local resetBtn = makeButton("[RESET]", UDim2.new(0, 208, 0, 240), UDim2.new(0, 92, 0, 32), Color3.fromRGB(70, 80, 100))
 
-	local recalibBtn = makeButton("RECALIBRAR", UDim2.new(0, 10, 0, 265), UDim2.new(0, 122, 0, 30), Color3.fromRGB(55, 95, 160))
-	local debugBtn   = makeButton("DEBUG: ON",  UDim2.new(0, 138, 0, 265), UDim2.new(0, 122, 0, 30), Color3.fromRGB(110, 80, 150))
+	local recalibBtn = makeButton("RECALIBRAR", UDim2.new(0, 10, 0, 280), UDim2.new(0, 140, 0, 30), Color3.fromRGB(55, 95, 160))
+	local debugBtn   = makeButton("DEBUG: ON",  UDim2.new(0, 160, 0, 280), UDim2.new(0, 140, 0, 30), Color3.fromRGB(110, 80, 150))
 
-	-- Dragging da Janela
+	-- Dragging
 	local dragging, dragInput, dragStart, startPos
 	titleBar.InputBegan:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
@@ -642,12 +645,11 @@ local function createUI()
 		end
 	end)
 
-	-- Eventos dos Botões
 	startBtn.MouseButton1Click:Connect(function()
 		if State.IsRunning then return end
 		State.IsRunning = true
 		State.StartTime = os.clock() - State.ElapsedTime
-		print("[STAR PROFILER] Cronômetro e medição INICIADOS.")
+		print("[STAR PROFILER v2] Medição de ABERTURAS iniciada.")
 	end)
 
 	stopBtn.MouseButton1Click:Connect(function()
@@ -662,21 +664,23 @@ local function createUI()
 		State.IsRunning = false
 		State.StartTime = 0
 		State.ElapsedTime = 0
-		State.TotalRolls = 0
-		State.TotalBatches = 0
-		State.LastRollTimestamp = nil
-		State.CurrentBatchTimestamp = 0
-		State.CurrentBatchCount = 0
-		State.CurrentBatchSpawnedCards = 0
+		State.TotalOpenings = 0
+		State.LastOpeningTimestamp = nil
+		State.AnchorPath = nil
+		State.AnchorType = nil
+		State.AnchorPriority = 0
 		State.MinInterval = math.huge
 		State.MaxInterval = 0
 		State.LastInterval = 0
 		table.clear(State.Intervals)
-		table.clear(State.RollHistory)
-		print("[STAR PROFILER] Dados resetados.")
+		table.clear(State.OpeningHistory)
+		print("[STAR PROFILER v2] Histórico e Sinal Âncora resetados.")
 	end)
 
 	recalibBtn.MouseButton1Click:Connect(function()
+		State.AnchorPath = nil
+		State.AnchorType = nil
+		State.AnchorPriority = 0
 		scanAndConnect()
 	end)
 
@@ -686,7 +690,6 @@ local function createUI()
 		debugBtn.BackgroundColor3 = DEBUG and Color3.fromRGB(110, 80, 150) or Color3.fromRGB(60, 60, 70)
 	end)
 
-	-- Loop leve de atualização visual da interface
 	local renderConn
 	renderConn = RunService.RenderStepped:Connect(function()
 		local now = os.clock()
@@ -695,42 +698,42 @@ local function createUI()
 		end
 
 		local elapsed = State.ElapsedTime
-		local rpm = (elapsed > 0) and ((State.TotalRolls / elapsed) * 60) or 0
+		local opm = (elapsed > 0) and ((State.TotalOpenings / elapsed) * 60) or 0
 		local avgInt = getAverageInterval()
 		local minInt = (State.MinInterval == math.huge) and 0 or State.MinInterval
 		local maxInt = State.MaxInterval
 		local c10, c30, c60 = getRollingWindowCounts(now)
 
 		statsLabel.Text = string.format(
-			"STATUS: %s\n" ..
-			"GIROS: %d\n" ..
-			"TEMPO: %.2fs\n" ..
-			"GIROS/MIN: %.1f\n" ..
-			"INTERVALO MÉDIO: %.2fs\n" ..
-			"ÚLTIMO GIRO: %.2fs\n" ..
-			"MENOR INTERVALO: %.2fs\n" ..
-			"MAIOR INTERVALO: %.2fs\n" ..
-			"10s | 30s | 60s: %d | %d | %d",
+			"STATUS: %s | TEMPO: %.2fs\n" ..
+			"ABERTURAS: %d\n" ..
+			"ABERTURAS/MIN: %.1f\n" ..
+			"INTERVALO MÉDIO ENTRE ABERTURAS: %.3fs\n" ..
+			"MENOR INTERVALO: %.3fs\n" ..
+			"MAIOR INTERVALO: %.3fs\n" ..
+			"ÚLTIMO INTERVALO: %.3fs\n" ..
+			"10s | 30s | 60s: %d | %d | %d\n" ..
+			"ÂNCORA: %s",
 			State.IsRunning and '<font color="#55ff7f">RODANDO</font>' or '<font color="#ffaa55">PARADO</font>',
-			State.TotalRolls,
 			elapsed,
-			rpm,
+			State.TotalOpenings,
+			opm,
 			avgInt,
-			State.LastInterval,
 			minInt,
 			maxInt,
-			c10, c30, c60
+			State.LastInterval,
+			c10, c30, c60,
+			State.AnchorType and (State.AnchorType .. " (Travado)") or "Aguardando 1º giro..."
 		)
 	end)
 
-	-- Limpeza total ao fechar no [X]
 	closeBtn.MouseButton1Click:Connect(function()
 		State.IsRunning = false
 		if renderConn then renderConn:Disconnect() end
 		if dragConn then dragConn:Disconnect() end
 		clearWatchers()
 		screenGui:Destroy()
-		print("[STAR PROFILER] Encerrado e todas as conexões foram limpas.")
+		print("[STAR PROFILER v2] Encerrado.")
 	end)
 end
 
